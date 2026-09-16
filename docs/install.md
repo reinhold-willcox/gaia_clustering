@@ -6,7 +6,7 @@ The scientific stack (NumPy, Astropy, PyMC, Plotly) is easiest from conda-forge.
 A ready-made spec lives in `environment.yml` at the repository root:
 
 ```bash
-git clone https://github.com/rwillcox/gaia_clustering.git
+git clone https://github.com/reinhold-willcox/gaia_clustering.git
 cd gaia_clustering
 conda env create -f environment.yml
 conda activate gaia_clustering

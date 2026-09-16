@@ -46,10 +46,10 @@ docs = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/rwillcox/gaia_clustering"
-Documentation = "https://rwillcox.github.io/gaia_clustering/"
-Issues = "https://github.com/rwillcox/gaia_clustering/issues"
-Source = "https://github.com/rwillcox/gaia_clustering"
+Homepage = "https://github.com/reinhold-willcox/gaia_clustering"
+Documentation = "https://reinhold-willcox.github.io/gaia_clustering/"
+Issues = "https://github.com/reinhold-willcox/gaia_clustering/issues"
+Source = "https://github.com/reinhold-willcox/gaia_clustering"
 
 [project.scripts]
 gaia-clustering = "gaia_clustering.cli:main"

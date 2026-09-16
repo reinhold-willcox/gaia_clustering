@@ -68,7 +68,7 @@ exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
 html_theme = "furo"
 html_title = "gaia_clustering"
 html_theme_options = {
-    "source_repository": "https://github.com/rwillcox/gaia_clustering/",
+    "source_repository": "https://github.com/reinhold-willcox/gaia_clustering/",
     "source_branch": "main",
     "source_directory": "docs/",
 }
