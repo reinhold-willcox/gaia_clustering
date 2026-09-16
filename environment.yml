@@ -1,0 +1,17 @@
+name: gaia_clustering
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.10
+  - numpy
+  - pandas
+  - scipy
+  - matplotlib
+  - plotly
+  - astropy
+  - pymc
+  - arviz
+  - corner
+  - pip
+  - pip:
+      - -e .

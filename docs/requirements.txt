@@ -1,0 +1,8 @@
+# Documentation build (no PyMC). Autodoc mocks pymc/plotly/arviz/corner.
+sphinx>=7.0
+furo>=2024.0
+myst-parser>=2.0
+numpy
+pandas
+matplotlib
+astropy

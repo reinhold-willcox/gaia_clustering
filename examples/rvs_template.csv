@@ -1,0 +1,4 @@
+# Independent radial velocities (km/s). Gaia RVs are never used.
+# Match on source_id (Gaia DR3) and/or name.
+source_id,name,radial_velocity,radial_velocity_error
+123456789012345678,HD 226868,-5.10,0.50
