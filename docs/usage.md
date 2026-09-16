@@ -2,30 +2,36 @@
 
 ## Python API
 
-The usual entry point is {func}`gaia_clustering.analyze_association`.
+Query Gaia first, inspect the cone and parallax window, then cluster:
 
 ```python
-from gaia_clustering import analyze_association
+from gaia_clustering import query_association, analyze_association
 
-# Cluster / association name
-result = analyze_association("Cyg OB3", radius_deg=1.5, g_max=12)
+query = query_association("Cyg OB3", radius_deg=1.5, g_max=12)
+query.plot_query()   # preview neighbourhood vs selected cone and ϖ cuts
 
-# Or a star inside the association
-result = analyze_association("Cyg X-1", radius_deg=2.0, g_max=12)
+# Optional: tighten or widen cuts without a new TAP query
+# (radius must stay inside the preview cone, default 2× radius_deg)
+query.select(radius_deg=1.2, parallax_window=(0.5, 2.0))
+query.plot_query()
 
-# Independent RVs (CSV with source_id or name + radial_velocity + error)
-result = analyze_association(
-    "Cyg OB3",
-    rv_path="my_rvs.csv",
-    membership_probability_threshold=0.9,
-)
-
+result = analyze_association(query)
 print(result.summary())
 result.plot_summary()
 result.plot_corner()
 result.plot_3d(traceback=(0, 10))   # slider, Myr lookback
 result.plot_velocity()
 result.save("results/cyg_ob3")
+```
+
+A star inside the association works the same way; SIMBAD coordinates
+centre the cone, and a Gaia DR3 source id (when Sesame publishes one)
+sets the reference parallax for the multiplicative window:
+
+```python
+query = query_association("Cyg X-1", radius_deg=2.0, g_max=12)
+query.plot_query()
+result = analyze_association(query, rv_path="my_rvs.csv", membership_probability_threshold=0.9)
 ```
 
 Skip the Gaia query by passing a catalogue:
@@ -37,6 +43,10 @@ result = analyze_association(
     infer_velocity=True,
 )
 ```
+
+The CLI still runs query and clustering in one shot (no interactive
+preview). `analyze_association("Cyg OB3", ...)` remains valid for
+scripts that already know the cuts.
 
 ## Command line
 

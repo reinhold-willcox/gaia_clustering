@@ -31,7 +31,7 @@ autodoc_default_options = {
     "members": True,
     "undoc-members": False,
     "show-inheritance": True,
-    "exclude-members": "_json_default",
+    "exclude-members": "_json_default, _UNSET",
 }
 # Keep the HTML build light: these packages are imported at module level
 # but are not required to render signatures and docstrings.

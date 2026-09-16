@@ -3,7 +3,7 @@
 ## Coordinates
 
 Gaia observables are packed as
-$(\alpha, \delta, \pi, \mu_{\alpha*}, \mu_{\delta}[, v_r])$
+$(\alpha, \delta, \varpi, \mu_{\alpha*}, \mu_{\delta}[, v_r])$
 in degrees, mas, mas/yr, and km/s. Gaia `ra_error` / `dec_error` are mas
 and are converted to degrees. The pipeline converts to ICRS phase space
 $(X, Y, Z)$ in pc and $(V_X, V_Y, V_Z)$ in km/s, propagating each star's
@@ -35,9 +35,9 @@ After membership, members are fit with a hierarchical Bayesian velocity
 Gaussian (PyMC / NUTS):
 
 - Population velocities $(v_\alpha, v_\delta[, v_r]) \sim \mathcal{N}(\mu, \Sigma)$
-- Latent distance with $p(d) \propto d^2$ (uniform in volume); $\pi = 1/d$
-- Predicted proper motions $\mu_{\alpha,\delta} = v_{\alpha,\delta}\, \pi / 4.74047$
-- Gaia likelihood on $(\pi, \mu_\alpha, \mu_\delta)$
+- Latent distance with $p(d) \propto d^2$ (uniform in volume); $\varpi = 1/d$
+- Predicted proper motions $\mu_{\alpha,\delta} = v_{\alpha,\delta}\, \varpi / 4.74047$
+- Gaia likelihood on $(\varpi, \mu_\alpha, \mu_\delta)$
 - Independent RVs, when present, add a 1D likelihood on $v_r$ for those stars only
 
 If nobody has RV the fit is 2D (tangential). The scalar summary is
@@ -46,6 +46,17 @@ $\sigma_{1\mathrm{D}} = \sqrt{\mathrm{mean}(\sigma_i^2)}$.
 This Gaussian describes **today's** member velocity scatter, including
 expansion or streaming. It is not a birth-time isotropic jitter unless
 the association is cold and non-expanding.
+
+## Query inspection
+
+{func}`~gaia_clustering.pipeline.query_association` downloads a preview
+cone (default $2\times$ the selected radius) without applying the
+parallax window to that preview table. {func}`~gaia_clustering.plots.plot_query`
+then shows on-sky positions with the selected cone overlaid, and each
+star as $\mathcal{N}(\varpi, \sigma_\varpi^2)$ with vertical lines at
+the current multiplicative parallax cuts. Clustering starts only when
+the {class}`~gaia_clustering.pipeline.GaiaQuery` is passed to
+{func}`~gaia_clustering.pipeline.analyze_association`.
 
 ## Traceback
 
