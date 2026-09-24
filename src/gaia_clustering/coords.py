@@ -22,7 +22,7 @@ import numpy as np
 import astropy.units as u
 from astropy.coordinates import CartesianDifferential, CartesianRepresentation, SkyCoord
 
-# v [km/s] = AU_KMS * μ [mas/yr] / π [mas]
+# v [km/s] = AU_KMS * μ [mas/yr] / ϖ [mas]
 AU_KMS = 4.74047
 
 _ASTROMETRY_MEAN_COLUMNS = (
@@ -145,7 +145,7 @@ def _symmetrize_cov(cov, n):
 
 
 def pack_observables(data, cov=None, use_rv=None):
-    """Pack (α, δ, π, μα*, μδ, vr) means and a 6×6 covariance per star.
+    """Pack (α, δ, ϖ, μα*, μδ, vr) means and a 6×6 covariance per star.
 
     Parameters
     ----------

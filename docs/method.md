@@ -31,8 +31,14 @@ Two stages:
 
 ## Velocity dispersion
 
-After membership, members are fit with a hierarchical Bayesian velocity
-Gaussian (PyMC / NUTS):
+After membership, stars in **one** spatial lobe are fit with a
+hierarchical Bayesian velocity Gaussian (PyMC / NUTS). When BIC prefers
+a single lobe, all hard members are used. When `preferred_K > 1`,
+{func}`~gaia_clustering.pipeline.analyze_association` requires
+`velocity_cluster_id` (the same integer as the `cluster_id` column;
+summary colorbars are labelled `cluster_id + 1`) and fits only that lobe.
+
+The generative model:
 
 - Population velocities $(v_\alpha, v_\delta[, v_r]) \sim \mathcal{N}(\mu, \Sigma)$
 - Latent distance with $p(d) \propto d^2$ (uniform in volume); $\varpi = 1/d$
@@ -49,14 +55,29 @@ the association is cold and non-expanding.
 
 ## Query inspection
 
-{func}`~gaia_clustering.pipeline.query_association` downloads a preview
-cone (default $2\times$ the selected radius) without applying the
-parallax window to that preview table. {func}`~gaia_clustering.plots.plot_query`
-then shows on-sky positions with the selected cone overlaid, and each
-star as $\mathcal{N}(\varpi, \sigma_\varpi^2)$ with vertical lines at
-the current multiplicative parallax cuts. Clustering starts only when
-the {class}`~gaia_clustering.pipeline.GaiaQuery` is passed to
-{func}`~gaia_clustering.pipeline.analyze_association`.
+{func}`~gaia_clustering.pipeline.query_association` downloads a Gaia
+cone at the name-resolved centre, using the requested radius, *G*
+limit, and optional parallax range. {meth}`~gaia_clustering.pipeline.GaiaQuery.refine_search`
+then tightens the on-sky centre and radius, an optional proper-motion
+cone, and the parallax range in memory (no new TAP query). The clustered
+catalogue is the stars that pass the selected on-sky cone, proper-motion
+cone (if set), and parallax range (if set). {func}`~gaia_clustering.plots.plot_query`
+then shows on-sky positions with the selected cone overlaid, proper
+motions, and individual parallaxes. The figure title is the queried
+name plus the accepted fraction. Colour encodes which cuts a star
+passes: pale red, blue, and yellow for sky, proper motion, and
+parallax alone; light purple, orange, and green for the two-cut
+mixes; dark brown for stars that pass all three; very light grey for
+none. The
+cone may be recentred with ``position_center`` on
+{meth}`~gaia_clustering.pipeline.GaiaQuery.refine_search`; a red X marks the
+name-resolved default position. A
+black KDE of parallaxes for stars that pass both the on-sky and
+proper-motion cuts (default bandwidth = mean $\sigma_\varpi$ of
+those stars, peak scaled to 90% of the axis) is overplotted on the parallax panel. Red boundary marks
+show the refined cone, proper-motion cone, and parallax range. Clustering
+starts only when the {class}`~gaia_clustering.pipeline.GaiaQuery` is
+passed to {func}`~gaia_clustering.pipeline.analyze_association`.
 
 ## Traceback
 

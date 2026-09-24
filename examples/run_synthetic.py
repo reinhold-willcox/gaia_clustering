@@ -18,11 +18,32 @@ def main():
           "{} with independent RV".format(
               len(df), meta["v_disp_kms"], int(df["radial_velocity"].notna().sum())
           ))
+    # Membership first without velocity so we can choose a lobe if BIC
+    # prefers K > 1.
+    preview = analyze_association(
+        name="synthetic two-lobe association",
+        catalog=df,
+        use_rv=None,
+        infer_velocity=False,
+        membership_probability_threshold=0.5,
+        random_state=0,
+        n_init=5,
+        max_iter=100,
+    )
+    preferred_K = int(preview.membership["best"]["preferred_K"])
+    velocity_cluster_id = 0 if preferred_K > 1 else None
+    if preferred_K > 1:
+        print(
+            "preferred_K = {}; fitting velocity for cluster_id = {}".format(
+                preferred_K, velocity_cluster_id,
+            )
+        )
     result = analyze_association(
         name="synthetic two-lobe association",
         catalog=df,
         use_rv=None,
         infer_velocity=True,
+        velocity_cluster_id=velocity_cluster_id,
         membership_probability_threshold=0.5,
         velocity_draws=400,
         velocity_tune=400,

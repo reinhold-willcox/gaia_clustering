@@ -8,7 +8,7 @@ Query Gaia around a stellar association (or a star inside one), separate members
 
 **Documentation:** [https://reinhold-willcox.github.io/gaia_clustering/](https://reinhold-willcox.github.io/gaia_clustering/)
 
-Gaia radial velocities are never used. Independently measured RVs can be attached per star.
+Gaia radial velocities are never used. Independently measured RVs can be attached per star. When spatial clustering prefers more than one lobe, the velocity fit takes a required `velocity_cluster_id`.
 
 ## Install
 
@@ -28,20 +28,23 @@ pip install -e .
 ## Quick start
 
 ```python
-from gaia_clustering import analyze_association
+from gaia_clustering import query_association, analyze_association
 
-result = analyze_association("Cyg OB3", radius_deg=1.5, g_max=12)
+query = query_association("Cyg OB3", position_radius_arcmin=10, g_max=20)
+query.plot_query()
+result = analyze_association(query)
+# If preferred_K > 1: analyze_association(query, velocity_cluster_id=0)
 print(result.summary())
 result.plot_3d(traceback=(0, 10))
 result.save("results/cyg_ob3")
 ```
 
 ```bash
-gaia-clustering "Cyg OB3" --radius 1.5 --g-max 12 -o results/cyg_ob3
+gaia-clustering "Cyg OB3" --radius 10 --g-max 20 -o results/cyg_ob3
 python examples/run_synthetic.py
 ```
 
-See the [usage guide](https://reinhold-willcox.github.io/gaia_clustering/usage.html) for independent RVs, CLI flags, and plot products, and the [method page](https://reinhold-willcox.github.io/gaia_clustering/method.html) for the membership and velocity models.
+See the [usage guide](https://reinhold-willcox.github.io/gaia_clustering/usage.html), the [worked example notebook](https://reinhold-willcox.github.io/gaia_clustering/example_systems.html), and the [method page](https://reinhold-willcox.github.io/gaia_clustering/method.html).
 
 ## Tests
 

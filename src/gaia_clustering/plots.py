@@ -6,11 +6,22 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch, Rectangle
 from matplotlib.lines import Line2D
-from matplotlib.colors import Normalize, to_hex
+from matplotlib.collections import LineCollection
+from matplotlib.colors import LinearSegmentedColormap, Normalize, hsv_to_rgb, to_hex
 from matplotlib.cm import ScalarMappable
 import plotly.graph_objects as go
 
 from gaia_clustering.coords import AU_KMS, coast_dataframe, star_uses_rv
+from gaia_clustering.query import (
+    cone_mask,
+    name_position,
+    parallax_bounds_mask,
+    proper_motion_mask,
+    resolved_parallax_bounds,
+    search_center,
+    sky_circle_radec,
+    wrap_ra_deg,
+)
 
 fs_title = 20
 fs_label = 16
@@ -18,13 +29,15 @@ fs_text = 14
 
 MEMBERSHIP_CMAP = "viridis"
 OUTLIER_COLOR = "lightblue"
+# HSV hues for K < 6: Blue, Red, Yellow, Cyan, Magenta.
+_LOBE_HUES_NAMED = (2.0 / 3.0, 0.0, 1.0 / 6.0, 0.5, 5.0 / 6.0)
 
 
 def set_membership_cmap(cmap):
-    """Set the default sequential colormap for membership plots.
+    """Set a fallback sequential colormap.
 
-    High :math:`P(\\mathrm{member})` is drawn at the dark end
-    (the colormap is reversed at plot time).
+    Membership plots use per-lobe HSV maps; this is kept for an explicit
+    ``cmap`` override on a single-lobe figure.
     """
     global MEMBERSHIP_CMAP
     MEMBERSHIP_CMAP = cmap
@@ -52,9 +65,74 @@ def _as_cmap(cmap=None):
     return cmap
 
 
+def _lobe_hues(n_lobes):
+    n = max(int(n_lobes), 1)
+    if n < 6:
+        return _LOBE_HUES_NAMED[:n]
+    return tuple(i / n for i in range(n))
+
+
+def _membership_hsv_rgb(h, p):
+    """RGB for hue ``h`` at membership probability ``p``.
+
+    :math:`P=1` is fully saturated at value 0.5. :math:`P=0` is saturation
+    0.25 at value 1. Saturation and value vary linearly with ``p``.
+    """
+    p = np.clip(np.asarray(p, dtype=float), 0.0, 1.0)
+    s = 0.25 + 0.75 * p
+    v = 1.0 - 0.5 * p
+    hsv = np.empty(p.shape + (3,), dtype=float)
+    hsv[..., 0] = h
+    hsv[..., 1] = s
+    hsv[..., 2] = v
+    return hsv_to_rgb(hsv)
+
+
+def _lobe_display_cmap(index, n_lobes):
+    """HSV sequential map for spatial lobe ``index`` of ``n_lobes``."""
+    hues = _lobe_hues(n_lobes)
+    h = hues[int(index) % len(hues)]
+    p = np.linspace(0.0, 1.0, 256)
+    rgb = _membership_hsv_rgb(h, p)
+    return LinearSegmentedColormap.from_list(
+        "membership_hsv_{}_{}".format(int(n_lobes), int(index)), rgb,
+    )
+
+
 def _membership_display_cmap(cmap=None):
     """Sequential map with high P(member) at the dark end."""
     return _as_cmap(cmap).reversed()
+
+
+def _lobe_ids(result):
+    if result is None or "cluster_id" not in result:
+        return ()
+    ids = np.asarray(result["cluster_id"])
+    return tuple(int(k) for k in np.unique(ids) if np.isfinite(k) and k >= 0)
+
+
+def _cluster_ids(result, n=None):
+    if result is not None and "cluster_id" in result:
+        return np.asarray(result["cluster_id"])
+    if n is None:
+        n = 0 if result is None else len(_member_prob(result))
+    return np.zeros(int(n), dtype=int)
+
+
+def _membership_styles(result=None, cmap=None):
+    """``(lobe_id or None, display colormap)`` pairs for membership colouring.
+
+    ``None`` as the id means apply one colormap to every star (single lobe
+    or no ``cluster_id``). Each preferred lobe gets an HSV sequential map:
+    fixed hue, saturation and value linear in :math:`P(\\mathrm{member})`.
+    """
+    ids = _lobe_ids(result)
+    n = max(len(ids), 1)
+    if cmap is not None and len(ids) <= 1:
+        return ((None, _membership_display_cmap(cmap)),)
+    if len(ids) <= 1:
+        return ((None, _lobe_display_cmap(0, n)),)
+    return tuple((k, _lobe_display_cmap(i, n)) for i, k in enumerate(ids))
 
 
 def _outlier_mask(result):
@@ -67,19 +145,26 @@ def _member_prob(result):
     return np.clip(np.asarray(result["member_prob"], dtype=float), 0.0, 1.0)
 
 
-def _membership_mappable(cmap=None):
-    return ScalarMappable(norm=Normalize(0.0, 1.0), cmap=_membership_display_cmap(cmap))
+def _membership_mappable(cmap):
+    return ScalarMappable(norm=Normalize(0.0, 1.0), cmap=cmap)
 
 
 def _scatter_membership(ax, x, y, result, s=50, cmap=None, zorder=3, outlier_color=None):
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
     p = _member_prob(result)
+    ids = _cluster_ids(result, n=len(p))
     mark = _outlier_color(outlier_color)
-    sc = ax.scatter(
-        x, y, c=p, cmap=_membership_display_cmap(cmap),
-        vmin=0.0, vmax=1.0, s=s, linewidths=0, zorder=zorder,
-    )
+    styles = _membership_styles(result, cmap)
+    last = None
+    for k, cm in styles:
+        mask = np.ones(len(p), dtype=bool) if k is None else ids == k
+        if not np.any(mask):
+            continue
+        last = ax.scatter(
+            x[mask], y[mask], c=p[mask], cmap=cm,
+            vmin=0.0, vmax=1.0, s=s, linewidths=0, zorder=zorder,
+        )
     out = _outlier_mask(result)
     if np.any(out):
         ax.scatter(
@@ -89,11 +174,14 @@ def _scatter_membership(ax, x, y, result, s=50, cmap=None, zorder=3, outlier_col
             edgecolors=mark,
             linewidths=1, zorder=zorder + 1,
         )
-    return sc
+    return last
 
 
 def _plotly_membership_colorscale(cmap=None, n=32):
-    cm = _membership_display_cmap(cmap)
+    if cmap is not None and not isinstance(cmap, str) and callable(cmap):
+        cm = cmap
+    else:
+        cm = _membership_display_cmap(cmap)
     xs = np.linspace(0.0, 1.0, n)
     scale = []
     for x, (r, g, b, _) in zip(xs, cm(xs)):
@@ -104,13 +192,55 @@ def _plotly_membership_colorscale(cmap=None, n=32):
     return scale
 
 
-def _add_membership_colorbar(obj, cmap=None, ax=None, **kwargs):
-    kwargs.setdefault("label", r"$P(\mathrm{member})$")
-    mappable = _membership_mappable(cmap)
-    mappable.set_array([])
-    if ax is None:
-        return obj.colorbar(mappable, **kwargs)
-    return plt.colorbar(mappable, ax=ax, **kwargs)
+def _cluster_colorbar_number(index):
+    return str(int(index) + 1)
+
+
+def _add_membership_colorbar(obj, cmap=None, ax=None, result=None, **kwargs):
+    styles = _membership_styles(result, cmap)
+    n = len(styles)
+    fraction = kwargs.pop("fraction", 0.046)
+    pad = kwargs.pop("pad", 0.04)
+    kwargs.pop("label", None)
+    # Each new colorbar is inserted closer to the axes, so create from
+    # last cluster to first: visual order is then 1, 2, … left to right.
+    cbars = [None] * n
+    for created, i in enumerate(range(n - 1, -1, -1)):
+        _, cm = styles[i]
+        mappable = _membership_mappable(cm)
+        mappable.set_array([])
+        cb_kwargs = dict(kwargs)
+        cb_kwargs["fraction"] = fraction if n == 1 else min(fraction, 0.035)
+        cb_kwargs["pad"] = pad if created == 0 else 0.02
+        if ax is None:
+            cb = obj.colorbar(mappable, **cb_kwargs)
+        else:
+            cb = plt.colorbar(mappable, ax=ax, **cb_kwargs)
+        cb.ax.set_title(_cluster_colorbar_number(i), fontsize=fs_label, pad=6)
+        if i == n - 1:
+            cb.set_label(r"$P(\mathrm{member})$", fontsize=fs_label)
+            cb.ax.tick_params(labelsize=fs_text)
+        else:
+            cb.set_label("")
+            cb.ax.tick_params(labelleft=False, labelright=False, labelsize=fs_text)
+        cbars[i] = cb
+    return cbars[0] if n == 1 else cbars
+
+
+def _membership_colors(result, cmap=None):
+    p = _member_prob(result)
+    ids = _cluster_ids(result, n=len(p))
+    styles = _membership_styles(result, cmap)
+    colors = np.zeros((len(p), 4))
+    assigned = np.zeros(len(p), dtype=bool)
+    fallback = styles[0][1]
+    for k, cm in styles:
+        mask = np.ones(len(p), dtype=bool) if k is None else ids == k
+        colors[mask] = cm(p[mask])
+        assigned[mask] = True
+    if np.any(~assigned):
+        colors[~assigned] = fallback(p[~assigned])
+    return colors
 
 
 def _membership_histogram(ax, x, result, edges, cmap=None, outlier_color=None):
@@ -122,8 +252,7 @@ def _membership_histogram(ax, x, result, edges, cmap=None, outlier_color=None):
     if x.size == 0:
         return
     mark = _outlier_color(outlier_color)
-    cm = _membership_display_cmap(cmap)
-    colors = cm(p)
+    colors = _membership_colors(result, cmap)[finite]
     n_bins = len(edges) - 1
     idx = np.searchsorted(edges, x, side="right") - 1
     idx = np.clip(idx, 0, n_bins - 1)
@@ -196,7 +325,7 @@ def _sky_space_coordinates(df, use_rv=None):
     labels = [
         r"$\alpha$ [deg]",
         r"$\delta$ [deg]",
-        r"$d=1/\pi$ [kpc]",
+        r"$d=1/\varpi$ [kpc]",
         r"$v_{\alpha*}$ [km/s]",
         r"$v_{\delta}$ [km/s]",
         r"$v_r$ [km/s]",
@@ -215,7 +344,7 @@ def _observable_coordinates(df, use_rv=None):
     labels = [
         r"$\alpha$ [deg]",
         r"$\delta$ [deg]",
-        r"$\pi$ [mas]",
+        r"$\varpi$ [mas]",
         r"$\mu_{\alpha*}$ [mas/yr]",
         r"$\mu_{\delta}$ [mas/yr]",
     ]
@@ -231,6 +360,11 @@ def _observable_coordinates(df, use_rv=None):
 
 def plot_sky_membership(df, result, true_labels=None, ax=None, cmap=None, colorbar=None, outlier_color=None):
     """Sky positions coloured by :math:`P(\\mathrm{member})`.
+
+    When more than one spatial lobe is preferred, each lobe uses its own
+    HSV sequential map (fixed hue; saturation and value linear in
+    :math:`P(\\mathrm{member})`). :math:`P=1` is fully saturated at value
+    0.5; :math:`P=0` is saturation 0.25 at value 1.
 
     Parameters
     ----------
@@ -276,7 +410,9 @@ def plot_sky_membership(df, result, true_labels=None, ax=None, cmap=None, colorb
     ax.invert_xaxis()
     ax.set_aspect("equal", adjustable="datalim")
     if colorbar:
-        _add_membership_colorbar(plt, cmap=cmap, ax=ax, fraction=0.046, pad=0.04)
+        _add_membership_colorbar(
+            plt, cmap=cmap, ax=ax, result=result, fraction=0.046, pad=0.04,
+        )
     return ax
 
 
@@ -306,12 +442,101 @@ def plot_proper_motion_membership(df, result, ax=None, cmap=None, colorbar=None,
     ax.tick_params(labelsize=fs_text)
     ax.set_aspect("equal", adjustable="datalim")
     if colorbar:
-        _add_membership_colorbar(plt, cmap=cmap, ax=ax, fraction=0.046, pad=0.04)
+        _add_membership_colorbar(
+            plt, cmap=cmap, ax=ax, result=result, fraction=0.046, pad=0.04,
+        )
+    return ax
+
+
+def plot_parallax_membership(df, result, ax=None, cmap=None, colorbar=None, outlier_color=None, alpha=0.35):
+    """Parallax Gaussians coloured by :math:`P(\\mathrm{member})`.
+
+    Each star is drawn as :math:`\\mathcal{N}(\\varpi, \\sigma_\\varpi^2)`.
+    Multiple preferred spatial lobes use the same HSV maps as the sky
+    and tangential-velocity panels. If parallax errors are
+    missing, a membership-coloured histogram of point estimates is used.
+
+    Parameters
+    ----------
+    df : DataFrame
+        Must contain ``parallax``; ``parallax_error`` is used when present.
+    result : dict
+        Clustering ``best`` result with ``member_prob`` and ``cluster_id``.
+    ax : matplotlib.axes.Axes, optional
+    cmap, outlier_color
+        Override the module defaults.
+    colorbar : bool, optional
+        Default True when a new figure is created.
+    alpha : float
+        Opacity of the individual Gaussian curves.
+
+    Returns
+    -------
+    matplotlib.axes.Axes
+    """
+    if ax is None:
+        _, ax = plt.subplots(figsize=(6.5, 5.5))
+        if colorbar is None:
+            colorbar = True
+    plx = np.asarray(df["parallax"], dtype=float)
+    if "parallax_error" in df.columns:
+        eplx = np.asarray(df["parallax_error"], dtype=float)
+    else:
+        eplx = np.full(len(plx), np.nan)
+    finite = np.isfinite(plx) & np.isfinite(eplx) & (eplx > 0)
+    if np.any(finite):
+        plx_f, eplx_f = plx[finite], eplx[finite]
+        lo = float(np.nanpercentile(plx_f - 3.0 * eplx_f, 1))
+        hi = float(np.nanpercentile(plx_f + 3.0 * eplx_f, 99))
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            lo, hi = float(np.min(plx_f) - 1.0), float(np.max(plx_f) + 1.0)
+        xs = np.linspace(lo, hi, 800)
+        pdfs = _norm_pdf(xs, plx_f, eplx_f)
+        colors = _membership_colors(result, cmap)[finite]
+        colors = np.array(colors, dtype=float, copy=True)
+        colors[:, 3] *= float(alpha)
+        p = _member_prob(result)[finite]
+        order = np.argsort(p)
+        segs = np.empty((pdfs.shape[0], xs.size, 2))
+        segs[:, :, 0] = xs
+        segs[:, :, 1] = pdfs
+        ax.add_collection(LineCollection(
+            segs[order], colors=colors[order], linewidths=0.5, zorder=3,
+        ))
+        ymax = float(np.nanmax(pdfs)) if pdfs.size else 0.0
+        ax.set_xlim(lo, hi)
+        ax.set_ylim(0.0, ymax * 1.08 if ymax > 0.0 else 1.0)
+        ax.set_ylabel(r"density [mas$^{-1}$]", fontsize=fs_label)
+    else:
+        point = np.isfinite(plx)
+        if not np.any(point):
+            ax.text(0.5, 0.5, "no finite parallaxes", ha="center", va="center")
+            ax.set_axis_off()
+            return ax
+        x = plx[point]
+        lo, hi = float(np.min(x)), float(np.max(x))
+        extra = 0.08 * (hi - lo) if hi > lo else 1.0
+        edges = np.linspace(lo - extra, hi + extra, 21)
+        _membership_histogram(
+            ax, plx, result, edges, cmap=cmap, outlier_color=outlier_color,
+        )
+        ax.set_xlim(lo - extra, hi + extra)
+        ax.set_ylabel("count", fontsize=fs_label)
+    ax.set_xlabel(r"$\varpi$ [mas]", fontsize=fs_label)
+    ax.set_title("Parallax clustering", fontsize=fs_title)
+    ax.tick_params(labelsize=fs_text)
+    if colorbar:
+        _add_membership_colorbar(
+            plt, cmap=cmap, ax=ax, result=result, fraction=0.046, pad=0.04,
+        )
     return ax
 
 
 def plot_bic_comparison(comparison, ax=None):
-    """Bar chart of spatial-:math:`K` BIC values; the winner is highlighted.
+    """Bar chart of spatial-:math:`K` BIC values relative to the minimum.
+
+    Bars show :math:`\\mathrm{BIC} - \\mathrm{BIC}_{\\min}` so the winning
+    :math:`K` sits at zero. Each bar is labelled with that offset.
 
     Parameters
     ----------
@@ -328,17 +553,27 @@ def plot_bic_comparison(comparison, ax=None):
     if ax is None:
         _, ax = plt.subplots(figsize=(5.5, 4.2))
     tab = comparison.sort_values("K")
+    bic = np.asarray(tab["BIC"], dtype=float)
+    delta = bic - np.nanmin(bic)
     colors = ["C0" if k == comparison.loc[0, "K"] else "0.75" for k in tab["K"]]
-    ax.bar(tab["K"].astype(str), tab["BIC"], color=colors)
+    bars = ax.bar(tab["K"].astype(str), delta, color=colors)
+    ax.bar_label(bars, labels=["{:.2f}".format(v) for v in delta], padding=3)
+    ymax = float(np.nanmax(delta)) if np.any(np.isfinite(delta)) else 0.0
+    ax.set_ylim(0.0, 1.0 if ymax <= 0 else ymax * 1.18)
     ax.set_xlabel(r"spatial clusters $K$ among members", fontsize=fs_label)
-    ax.set_ylabel("BIC", fontsize=fs_label)
+    ax.yaxis.tick_right()
+    ax.yaxis.set_label_position("right")
+    ax.set_ylabel(r"BIC $-$ BIC$_{\rm min}$", fontsize=fs_label)
     ax.set_title("Lobe-count comparison", fontsize=fs_title)
     ax.tick_params(labelsize=fs_text)
     return ax
 
 
-def plot_membership_summary(df, fit, figsize=(15, 4.8), cmap=None, outlier_color=None):
-    """Sky, tangential-velocity, and spatial-:math:`K` BIC in one figure.
+def plot_membership_summary(df, fit, figsize=(20, 4.8), cmap=None, outlier_color=None):
+    """Sky, tangential-velocity, parallax, and spatial-:math:`K` ΔBIC in one figure.
+
+    Membership panels use one HSV sequential map per preferred spatial
+    lobe (Blue, Red, Yellow, Cyan, Magenta for :math:`K<6`).
 
     Parameters
     ----------
@@ -354,28 +589,612 @@ def plot_membership_summary(df, fit, figsize=(15, 4.8), cmap=None, outlier_color
     fig : matplotlib.figure.Figure
     axes : ndarray of Axes
     """
-    fig, axes = plt.subplots(1, 3, figsize=figsize)
+    fig, axes = plt.subplots(1, 4, figsize=figsize, layout="constrained")
     plot_sky_membership(
         df, fit["best"], ax=axes[0], cmap=cmap, outlier_color=outlier_color, colorbar=False,
     )
     plot_proper_motion_membership(
-        df, fit["best"], ax=axes[1], cmap=cmap, outlier_color=outlier_color, colorbar=True,
+        df, fit["best"], ax=axes[1], cmap=cmap, outlier_color=outlier_color, colorbar=False,
+    )
+    plot_parallax_membership(
+        df, fit["best"], ax=axes[2], cmap=cmap, outlier_color=outlier_color, colorbar=False,
+    )
+    _add_membership_colorbar(
+        fig, cmap=cmap, ax=[axes[0], axes[1], axes[2]], result=fit["best"],
+        fraction=0.03, pad=0.02, shrink=0.78,
     )
     if fit.get("comparison") is not None:
-        plot_bic_comparison(fit["comparison"], ax=axes[2])
+        plot_bic_comparison(fit["comparison"], ax=axes[3])
     else:
-        axes[2].text(0.5, 0.5, "too few members\nfor spatial $K$", ha="center", va="center")
-        axes[2].set_axis_off()
-    fig.tight_layout()
+        axes[3].text(0.5, 0.5, "too few members\nfor spatial $K$", ha="center", va="center")
+        axes[3].set_axis_off()
     return fig, axes
+
+
+def _query_center(info):
+    return search_center(info)
+
+
+def _query_radius_deg(info):
+    if info.get("radius_deg") is not None:
+        return float(info["radius_deg"])
+    for key in ("position_radius_arcmin", "radius_arcmin"):
+        if info.get(key) is not None:
+            return float(info[key]) / 60.0
+    return 0.0
+
+
+def _query_radius_arcmin(info):
+    for key in ("position_radius_arcmin", "radius_arcmin"):
+        if info.get(key) is not None:
+            return float(info[key])
+    return _query_radius_deg(info) * 60.0
+
+
+def _query_cut_masks(df, info):
+    ra0, dec0 = _query_center(info)
+    in_cone = cone_mask(df, ra0, dec0, _query_radius_deg(info))
+    in_plx = parallax_bounds_mask(df, resolved_parallax_bounds(info))
+    in_pm = proper_motion_mask(df, info)
+    return in_cone, in_plx, in_pm, in_cone & in_plx & in_pm
+
+
+def _norm_pdf(x, mean, sigma):
+    sigma = np.maximum(np.asarray(sigma, dtype=float), 1e-12)
+    mean = np.asarray(mean, dtype=float)
+    z = (x[None, :] - mean[:, None]) / sigma[:, None]
+    return np.exp(-0.5 * z * z) / (sigma[:, None] * np.sqrt(2.0 * np.pi))
+
+
+def _gaussian_kde_fixed(x, samples, bandwidth, chunk=4096):
+    """Gaussian KDE with a constant bandwidth in the same units as ``x``."""
+    x = np.asarray(x, dtype=float)
+    samples = np.asarray(samples, dtype=float)
+    h = float(bandwidth)
+    n = samples.size
+    if n == 0 or not np.isfinite(h) or h <= 0:
+        return None
+    dens = np.zeros_like(x)
+    for i in range(0, n, int(chunk)):
+        mu = samples[i:i + int(chunk)]
+        z = (x[None, :] - mu[:, None]) / h
+        dens += np.exp(-0.5 * z * z).sum(axis=0)
+    return dens / (n * h * np.sqrt(2.0 * np.pi))
+
+
+def _format_center_radius_text(x, y, radius=None, radius_unit=""):
+    text = "Center: ({:.2f}, {:+.2f})".format(float(x), float(y))
+    if radius is None:
+        return text
+    r = float(radius)
+    if not np.isfinite(r):
+        return text
+    if abs(r - round(r)) < 1e-6:
+        rtxt = "{:.0f}".format(r)
+    else:
+        rtxt = "{:.1f}".format(r)
+    return "{}, radius: {}{}".format(text, rtxt, radius_unit)
+
+
+# Pale primaries for a single cut, slightly stronger pastels for two cuts,
+# dark brown when a star passes sky, proper motion, and parallax.
+_QUERY_CUT_COLORS = {
+    "sky": "#ffacac",
+    "pm": "#acc8ff",
+    "plx": "#fff094",
+    "sky_pm": "#cc93e7",
+    "sky_plx": "#f7b86b",
+    "pm_plx": "#8bd68b",
+    "all": "#4a2c12",
+    "none": "0.88",
+}
+
+
+def _query_selection_groups(in_cone, in_pm, in_plx):
+    """Scatter/Gaussian groups for the three query cuts.
+
+    Sky is pale red, proper motion pale blue, parallax pale yellow.
+    Two-cut stars use a slightly stronger mixed pastel; stars that
+    pass all three are dark brown; stars that pass none are very light grey.
+    """
+    sky = np.asarray(in_cone, dtype=bool)
+    pm = np.asarray(in_pm, dtype=bool)
+    plx = np.asarray(in_plx, dtype=bool)
+    c = _QUERY_CUT_COLORS
+    return (
+        (~sky & ~pm & ~plx, c["none"], 2),
+        (sky & ~pm & ~plx, c["sky"], 3),
+        (~sky & pm & ~plx, c["pm"], 3),
+        (~sky & ~pm & plx, c["plx"], 3),
+        (sky & pm & ~plx, c["sky_pm"], 4),
+        (sky & ~pm & plx, c["sky_plx"], 4),
+        (~sky & pm & plx, c["pm_plx"], 4),
+        (sky & pm & plx, c["all"], 5),
+    )
+
+
+def _query_point_style(color, ms):
+    """Kwargs shared by preview points and the matching legend markers."""
+    return dict(
+        linestyle="none",
+        linewidth=0,
+        marker="o",
+        markersize=float(ms),
+        color=color,
+        markerfacecolor=color,
+        markeredgecolor=color,
+        markeredgewidth=0.0,
+        fillstyle="full",
+    )
+
+
+def _query_legend_marker(color, ms):
+    return Line2D([0], [0], **_query_point_style(color, ms))
+
+
+def _magnitude_marker_sizes(mag, ms, n=None, ms_min_frac=0.3, ms_floor=2.0):
+    """Scatter ``s`` (points²) linear in *G*: brightest → ``ms``, faintest still visible."""
+    ms_max = float(ms)
+    ms_min = max(float(ms_floor), float(ms_min_frac) * ms_max)
+    if n is None:
+        n = 0 if mag is None else len(np.asarray(mag))
+    n = int(n)
+    if n <= 0:
+        return np.zeros(0, dtype=float)
+    s_max = ms_max * ms_max
+    s_min = ms_min * ms_min
+    if mag is None:
+        return np.full(n, s_max)
+    mag = np.asarray(mag, dtype=float)
+    if mag.size != n:
+        raise ValueError("magnitude array length must match the number of stars")
+    sizes = np.full(n, s_min)
+    ok = np.isfinite(mag)
+    if not np.any(ok):
+        return sizes
+    lo, hi = float(np.min(mag[ok])), float(np.max(mag[ok]))
+    if hi <= lo:
+        sizes[ok] = s_max
+        return sizes
+    diam = ms_max + (ms_min - ms_max) * (mag[ok] - lo) / (hi - lo)
+    sizes[ok] = diam * diam
+    return sizes
+
+
+def _scatter_query_groups(ax, x, y, groups, sizes):
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    sizes = np.asarray(sizes, dtype=float)
+    for mask, color, zorder in groups:
+        if not np.any(mask):
+            continue
+        finite = np.asarray(mask) & np.isfinite(x) & np.isfinite(y)
+        if not np.any(finite):
+            continue
+        order = np.argsort(sizes[finite])
+        ax.scatter(
+            x[finite][order], y[finite][order],
+            s=sizes[finite][order],
+            c=color,
+            marker="o",
+            linewidths=0,
+            zorder=zorder,
+        )
+
+
+def _pm_circle(pmra0, pmdec0, radius, n=256):
+    th = np.linspace(0.0, 2.0 * np.pi, int(n))
+    return pmra0 + radius * np.cos(th), pmdec0 + radius * np.sin(th)
+
+
+def _as_axis_range(value, name):
+    if value is None:
+        return None
+    seq = tuple(value)
+    if len(seq) != 2:
+        raise ValueError("{} must be a (lo, hi) pair".format(name))
+    lo, hi = float(seq[0]), float(seq[1])
+    if not (np.isfinite(lo) and np.isfinite(hi) and hi > lo):
+        raise ValueError("{} must satisfy lo < hi with finite values".format(name))
+    return (lo, hi)
+
+
+def plot_query(
+    query,
+    figsize=(19.2, 6.4),
+    n_gaussians=None,
+    random_state=0,
+    ms=5,
+    parallax_alpha=0.1,
+    kde_bandwidth=None,
+    ra_range=None,
+    dec_range=None,
+    pmra_range=None,
+    pmdec_range=None,
+    parallax_range=None,
+    density_range=None,
+):
+    """Sky, proper-motion, and parallax diagnostics for a Gaia neighbourhood.
+
+    The left panel shows the downloaded neighbourhood with the refined
+    on-sky cone as a red circle. Point (and Gaussian) colour encodes which of
+    the three cuts a star passes: pale red, blue, and yellow for sky,
+    proper motion, and parallax alone; light purple, orange, and green
+    for the two-cut mixes; dark brown for stars that pass all three;
+    very light grey for none. Marker diameter scales linearly with Gaia
+    *G* magnitude: the brightest star uses ``ms``, and fainter stars
+    stay large enough to see. The middle panel shows Gaia
+    :math:`(\\mu_{\\alpha*}, \\mu_\\delta)` with the refined
+    proper-motion cone in red when set. The right panel shows each star
+    as :math:`\\mathcal{N}(\\varpi, \\sigma_\\varpi^2)`, with red lines
+    at the refined parallax range. A black KDE of the parallaxes of
+    stars that pass both the on-sky cone and the proper-motion cut (when
+    set) is overplotted, using a fixed bandwidth (default: the mean
+    :math:`\\sigma_\\varpi` of those stars), rescaled so its peak sits
+    at 90% of the axis height. The
+    figure title is the queried name plus the accepted fraction. A red
+    X marks the name-resolved (default) sky position. Search cuts are
+    not changed here; call :meth:`~gaia_clustering.pipeline.GaiaQuery.refine_search`
+    first.
+
+    Parameters
+    ----------
+    query : GaiaQuery
+        Output of :func:`~gaia_clustering.pipeline.query_association`.
+    figsize : tuple of float
+    n_gaussians : int, optional
+        Maximum number of individual parallax Gaussians to draw. ``None``
+        (default) draws every star in the downloaded sample.
+    random_state : int
+        Sampling of individual Gaussians when ``n_gaussians`` is smaller
+        than the preview.
+    ms : float
+        Maximum marker diameter in points, used for the brightest star
+        on the sky and proper-motion panels and for the legend swatches.
+    parallax_alpha : float
+        Opacity of the individual parallax Gaussian curves.
+    kde_bandwidth : float, optional
+        Gaussian KDE bandwidth in mas. ``None`` (default) uses the mean
+        :math:`\\sigma_\\varpi` of stars that pass the sky and proper-motion
+        cuts.
+    ra_range, dec_range : tuple of float, optional
+        ``(lo, hi)`` in degrees for the sky axes. Right ascension
+        increases to the left.
+    pmra_range, pmdec_range : tuple of float, optional
+        ``(lo, hi)`` in mas/yr for the proper-motion axes.
+    parallax_range : tuple of float, optional
+        ``(lo, hi)`` in mas for the parallax axis. ``None`` (default)
+        chooses limits from the sample and the cuts.
+    density_range : tuple of float, optional
+        ``(lo, hi)`` for the parallax-panel *y* axis.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    axes : ndarray of Axes
+    """
+    info = dict(query.query)
+    df = query.extended
+    if df is None or len(df) == 0:
+        raise ValueError("query has no preview stars to plot")
+    if kde_bandwidth is not None:
+        kde_bandwidth = float(kde_bandwidth)
+        if not np.isfinite(kde_bandwidth) or kde_bandwidth <= 0:
+            raise ValueError("kde_bandwidth must be a positive finite value in mas")
+    ra0, dec0 = _query_center(info)
+    radius = _query_radius_deg(info)
+    radius_arcmin_sel = _query_radius_arcmin(info)
+    in_cone, in_plx, in_pm, selected = _query_cut_masks(df, info)
+    groups = _query_selection_groups(in_cone, in_pm, in_plx)
+
+    ra = wrap_ra_deg(np.asarray(df["ra"], dtype=float), ra0)
+    dec = np.asarray(df["dec"], dtype=float)
+    circ_ra, circ_dec = sky_circle_radec(ra0, dec0, radius)
+    circ_ra = wrap_ra_deg(circ_ra, ra0)
+
+    mag = df["phot_g_mean_mag"] if "phot_g_mean_mag" in df.columns else None
+    sizes = _magnitude_marker_sizes(mag, ms, n=len(df))
+
+    fig, axes = plt.subplots(1, 3, figsize=figsize, layout="constrained")
+    ax_sky, ax_pm, ax_plx = axes
+    title = getattr(query, "name", None) or info.get("input_name") or ""
+    n_acc = int(info.get("n_catalog", int(np.asarray(selected).sum())))
+    n_all = int(info.get("n_extended", len(query.extended)))
+    if title:
+        fig.suptitle("{} ({} / {} selected)".format(title, n_acc, n_all), fontsize=fs_title)
+    else:
+        fig.suptitle("{} / {} selected".format(n_acc, n_all), fontsize=fs_title)
+
+    cut_color = "red"
+    cut_lw = 1.6
+    _scatter_query_groups(ax_sky, ra, dec, groups, sizes)
+    ax_sky.plot(circ_ra, circ_dec, color=cut_color, lw=cut_lw, zorder=6)
+    name_xy = name_position(info)
+    if name_xy is not None:
+        ax_sky.scatter(
+            wrap_ra_deg(name_xy[0], ra0), name_xy[1],
+            marker="x", c=cut_color, s=90, linewidths=1.6, zorder=7,
+        )
+    ax_sky.text(
+        0.04, 0.96,
+        _format_center_radius_text(ra0, dec0, radius_arcmin_sel, "'"),
+        transform=ax_sky.transAxes,
+        ha="left", va="top",
+        fontsize=fs_text,
+        color="0.15",
+        bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="0.8", alpha=0.92),
+        zorder=8,
+    )
+    ax_sky.set_xlabel(r"$\alpha$ [deg]", fontsize=fs_label)
+    ax_sky.set_ylabel(r"$\delta$ [deg]", fontsize=fs_label)
+    ax_sky.set_title(
+        r"Sky positions", 
+        fontsize=fs_title,
+    )
+    ax_sky.tick_params(labelsize=fs_text, axis="x", labelrotation=45)
+    ax_sky.tick_params(labelsize=fs_text, axis="y")
+    for label in ax_sky.get_xticklabels():
+        label.set_ha("right")
+    cos_dec = max(float(np.cos(np.radians(dec0))), 0.05)
+    ra_lim = _as_axis_range(ra_range, "ra_range")
+    dec_lim = _as_axis_range(dec_range, "dec_range")
+    if ra_lim is not None:
+        ax_sky.set_xlim(wrap_ra_deg(ra_lim[1], ra0), wrap_ra_deg(ra_lim[0], ra0))
+    else:
+        ax_sky.invert_xaxis()
+    if dec_lim is not None:
+        ax_sky.set_ylim(*dec_lim)
+    if ra_lim is None and dec_lim is None:
+        ax_sky.set_aspect(1.0 / cos_dec, adjustable="datalim")
+    else:
+        ax_sky.set_aspect("auto")
+
+    if "pmra" in df.columns and "pmdec" in df.columns:
+        _scatter_query_groups(ax_pm, df["pmra"], df["pmdec"], groups, sizes)
+        pm0 = info.get("pm_center")
+        pm_r = info.get("pm_radius")
+        if pm0 is not None and pm_r is not None and np.isfinite(pm_r) and pm_r > 0:
+            pmc_x, pmc_y = _pm_circle(float(pm0[0]), float(pm0[1]), float(pm_r))
+            ax_pm.plot(pmc_x, pmc_y, color=cut_color, lw=cut_lw, zorder=6)
+        if pm0 is not None:
+            pm_radius_txt = None
+            if pm_r is not None and np.isfinite(pm_r) and pm_r > 0:
+                pm_radius_txt = float(pm_r)
+            ax_pm.text(
+                0.04, 0.96,
+                _format_center_radius_text(
+                    float(pm0[0]), float(pm0[1]), pm_radius_txt,
+                    r" mas yr$^{-1}$",
+                ),
+                transform=ax_pm.transAxes,
+                ha="left", va="top",
+                fontsize=fs_text,
+                color="0.15",
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="white", edgecolor="0.8", alpha=0.92),
+                zorder=8,
+            )
+        pmra_lim = _as_axis_range(pmra_range, "pmra_range")
+        pmdec_lim = _as_axis_range(pmdec_range, "pmdec_range")
+        if pmra_lim is not None:
+            ax_pm.set_xlim(*pmra_lim)
+        if pmdec_lim is not None:
+            ax_pm.set_ylim(*pmdec_lim)
+        if pmra_lim is None and pmdec_lim is None:
+            ax_pm.set_aspect("equal", adjustable="datalim")
+        else:
+            ax_pm.set_aspect("auto")
+        ax_pm.set_xlabel(r"$\mu_{\alpha*}$ [mas yr$^{-1}$]", fontsize=fs_label)
+        ax_pm.set_ylabel(r"$\mu_{\delta}$ [mas yr$^{-1}$]", fontsize=fs_label)
+        ax_pm.set_title("Proper motions", fontsize=fs_title)
+        ax_pm.tick_params(labelsize=fs_text)
+    else:
+        ax_pm.text(0.5, 0.5, "no proper motions", ha="center", va="center")
+        ax_pm.set_axis_off()
+
+    plx = np.asarray(df["parallax"], dtype=float)
+    eplx = np.asarray(df["parallax_error"], dtype=float)
+    finite = np.isfinite(plx) & np.isfinite(eplx) & (eplx > 0)
+    if not np.any(finite):
+        ax_plx.text(0.5, 0.5, "no finite parallaxes", ha="center", va="center")
+        ax_plx.set_axis_off()
+        _query_preview_legend(fig, cut_lw, ms=ms)
+        return fig, axes
+
+    plx_f, eplx_f = plx[finite], eplx[finite]
+    groups_f = tuple((mask[finite], color, zorder) for mask, color, zorder in groups)
+    user_range = _as_axis_range(parallax_range, "parallax_range")
+    dens_lim = _as_axis_range(density_range, "density_range")
+    if user_range is not None:
+        lo, hi = user_range
+    else:
+        lo = float(np.nanpercentile(plx_f - 3.0 * eplx_f, 1))
+        hi = float(np.nanpercentile(plx_f + 3.0 * eplx_f, 99))
+    cuts = resolved_parallax_bounds(info)
+    if cuts is not None and user_range is None:
+        lo = min(lo, cuts[0])
+        hi = max(hi, cuts[1])
+        span = hi - lo if hi > lo else 1.0
+        lo -= 0.04 * span
+        hi += 0.04 * span
+    if user_range is None and (not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo):
+        lo, hi = float(np.min(plx_f) - 1.0), float(np.max(plx_f) + 1.0)
+    xs = np.linspace(lo, hi, 800)
+    pdfs = _norm_pdf(xs, plx_f, eplx_f)
+
+    if n_gaussians is None:
+        n_draw = pdfs.shape[0]
+    else:
+        n_draw = min(int(n_gaussians), pdfs.shape[0])
+    ymax = 0.0
+    if n_draw > 0:
+        rng = np.random.default_rng(random_state)
+        if n_draw < pdfs.shape[0]:
+            idx = np.sort(rng.choice(pdfs.shape[0], size=n_draw, replace=False))
+        else:
+            idx = np.arange(pdfs.shape[0])
+        shown = pdfs[idx]
+        ymax = float(np.nanmax(shown))
+        pdf_groups = tuple((mask[idx], color, zorder) for mask, color, zorder in groups_f)
+        plx_alpha = float(parallax_alpha)
+        plx_lw = 0.5
+        for mask, color, zorder in pdf_groups:
+            if not np.any(mask):
+                continue
+            ax_plx.plot(
+                xs, np.atleast_2d(shown[mask]).T,
+                color=color, alpha=plx_alpha, lw=plx_lw, zorder=zorder,
+            )
+    show_kde = False
+    kde = None
+    in_cone_all, _, in_pm_all, _ = _query_cut_masks(query.extended, info)
+    plx_cone = np.asarray(query.extended["parallax"], dtype=float)
+    eplx_cone = np.asarray(query.extended["parallax_error"], dtype=float)
+    cone_ok = (
+        np.asarray(in_cone_all) & np.asarray(in_pm_all)
+        & np.isfinite(plx_cone) & np.isfinite(eplx_cone) & (eplx_cone > 0)
+    )
+    if np.any(cone_ok):
+        h = float(np.mean(eplx_cone[cone_ok])) if kde_bandwidth is None else float(kde_bandwidth)
+        kde = _gaussian_kde_fixed(xs, plx_cone[cone_ok], h)
+        if kde is not None and np.any(np.isfinite(kde)):
+            show_kde = True
+    ax_plx.set_xlim(lo, hi)
+    if dens_lim is not None:
+        ax_plx.set_ylim(*dens_lim)
+    elif ymax > 0.0:
+        ax_plx.set_ylim(0.0, ymax * 1.08)
+    else:
+        ax_plx.set_ylim(bottom=0.0)
+    y0, y1 = ax_plx.get_ylim()
+    if show_kde:
+        kde_max = float(np.nanmax(kde))
+        if kde_max > 0.0 and y1 > y0:
+            kde = kde * (0.9 * (y1 - y0)) / kde_max
+        ax_plx.plot(xs, kde, color="black", lw=1.8, zorder=8)
+    if cuts is not None:
+        ax_plx.plot(
+            [cuts[0], cuts[0]], [y0, y1],
+            color=cut_color, ls="-", lw=cut_lw, zorder=20,
+            solid_capstyle="butt",
+        )
+        ax_plx.plot(
+            [cuts[1], cuts[1]], [y0, y1],
+            color=cut_color, ls="-", lw=cut_lw, zorder=20,
+            solid_capstyle="butt",
+        )
+    ax_plx.set_xlabel(r"$\varpi$ [mas]", fontsize=fs_label)
+    ax_plx.set_ylabel(r"density [mas$^{-1}$]", fontsize=fs_label)
+    ax_plx.set_title("Individual parallaxes", fontsize=fs_title)
+    ax_plx.tick_params(labelsize=fs_text)
+    _query_preview_legend(fig, cut_lw, show_kde=show_kde, ms=ms)
+    return fig, axes
+
+
+def _query_preview_legend(fig, cut_lw=1.6, show_kde=False, ms=8):
+    """Single figure legend for :func:`plot_query`."""
+    c = _QUERY_CUT_COLORS
+    handles = [_query_legend_marker(c[key], ms) for key in (
+        "sky", "pm", "plx", "all",
+    )]
+    labels = [
+        "consistent position",
+        "consistent proper motion",
+        "consistent parallax",
+        "accepted stars",
+    ]
+    if show_kde:
+        handles.append(Line2D([0], [0], color="black", lw=1.8))
+        labels.append("2-cone KDE")
+    handles.append(Line2D([0], [0], color="red", lw=cut_lw))
+    labels.append("boundary values")
+    return fig.legend(
+        handles, labels,
+        loc="outside lower center",
+        ncol=3,
+        frameon=False,
+        fontsize=fs_text,
+        handlelength=1.8,
+        columnspacing=1.4,
+    )
+
+
+def _legend_handles(ax):
+    handles, labels = ax.get_legend_handles_labels()
+    keep = [(h, lab) for h, lab in zip(handles, labels) if lab and not lab.startswith("_")]
+    if not keep:
+        return None, None
+    handles, labels = zip(*keep)
+    return handles, labels
+
+
+def _legend_away_from_data(ax, x, y, frac=0.32):
+    """Place a framed legend in the axes corner with the fewest data points."""
+    handles, labels = _legend_handles(ax)
+    if handles is None:
+        return None
+    xy = np.column_stack([np.asarray(x, dtype=float), np.asarray(y, dtype=float)])
+    finite = np.isfinite(xy).all(axis=1)
+    xy = xy[finite]
+    loc = "upper left"
+    ax.autoscale_view()
+    xlim, ylim = ax.get_xlim(), ax.get_ylim()
+    dx = xlim[1] - xlim[0]
+    dy = ylim[1] - ylim[0]
+    if xy.size and dx != 0.0 and dy != 0.0:
+        fx = (xy[:, 0] - xlim[0]) / dx
+        fy = (xy[:, 1] - ylim[0]) / dy
+        corners = {
+            "upper left": (0.0, 1.0),
+            "upper right": (1.0, 1.0),
+            "lower left": (0.0, 0.0),
+            "lower right": (1.0, 0.0),
+        }
+        best_n = np.inf
+        for name, (cx, cy) in corners.items():
+            in_x = fx <= frac if cx < 0.5 else fx >= 1.0 - frac
+            in_y = fy <= frac if cy < 0.5 else fy >= 1.0 - frac
+            n = int(np.count_nonzero(in_x & in_y))
+            if n < best_n:
+                loc = name
+                best_n = n
+    return ax.legend(
+        handles, labels,
+        loc=loc,
+        frameon=True,
+        fancybox=False,
+        framealpha=0.92,
+        facecolor="white",
+        edgecolor="0.8",
+        fontsize=fs_text,
+        borderaxespad=0.6,
+        handlelength=1.6,
+    )
+
+
+def _legend_below(ax, ncol=3):
+    """Place a legend below the axes so it does not cover the data."""
+    handles, labels = _legend_handles(ax)
+    if handles is None:
+        return None
+    return ax.legend(
+        handles, labels,
+        loc="upper left",
+        bbox_to_anchor=(0.0, -0.28),
+        borderaxespad=0.0,
+        frameon=False,
+        fontsize=fs_text,
+        ncol=min(int(ncol), len(labels)),
+    )
 
 
 def plot_association_corner(
     df, result, bins=12, title=None, cmap=None, outlier_color=None,
 ):
-    """Corner of :math:`(\\alpha, \\delta, \\pi, \\mu_{\\alpha*}, \\mu_{\\delta}[, v_r])`.
+    """Corner of :math:`(\\alpha, \\delta, \\varpi, \\mu_{\\alpha*}, \\mu_{\\delta}[, v_r])`.
 
     Points and histogram slices are coloured by :math:`P(\\mathrm{member})`.
+    Multiple preferred spatial lobes each get their own HSV sequential
+    map (fixed hue; paler at low :math:`P(\\mathrm{member})`).
     :math:`v_r` is included only for stars that contribute radial velocity;
     otherwise the figure is the 5D astrometric corner.
 
@@ -444,11 +1263,11 @@ def plot_association_corner(
 
     if title is None:
         if data.shape[1] == 6:
-            title = r"Association vs field in $(\alpha,\delta,\pi,\mu_{\alpha*},\mu_{\delta},v_r)$"
+            title = r"Association vs field in $(\alpha,\delta,\varpi,\mu_{\alpha*},\mu_{\delta},v_r)$"
         else:
-            title = r"Association vs field in $(\alpha,\delta,\pi,\mu_{\alpha*},\mu_{\delta})$"
+            title = r"Association vs field in $(\alpha,\delta,\varpi,\mu_{\alpha*},\mu_{\delta})$"
     _add_membership_colorbar(
-        fig, cmap=cmap, ax=axes, fraction=0.03, pad=0.02, shrink=0.55,
+        fig, cmap=cmap, ax=axes, result=result, fraction=0.03, pad=0.02, shrink=0.55,
     )
     fig.legend(
         handles=legend_handles, loc="upper right", fontsize=fs_text,
@@ -756,12 +1575,13 @@ class _Association3dFigure(go.Figure):
 def _association_3d_traces(
     df, result, residual=True, arrow_frac=0.15, show_vectors=True,
     head_size=0.02, cmap=None, outlier_color=None, global_span=None, v0=None,
+    show_colorbar=True,
 ):
     """Build Plotly traces and metadata for one traceback epoch."""
     use_rv = star_uses_rv(df, result)
     coords, _ = _sky_space_coordinates(df, use_rv=use_rv)
     ra, dec, dist, va, vd, vr = (coords[:, k] for k in range(6))
-    cluster_id = np.asarray(result["cluster_id"])
+    cluster_id = _cluster_ids(result, n=len(ra))
     p = _member_prob(result)
     out = _outlier_mask(result)
     mark = to_hex(_outlier_color(outlier_color))
@@ -798,35 +1618,56 @@ def _association_3d_traces(
 
     hover_names = _hover_names(df, n=len(ra))
     vr_hover = np.where(use_rv, vr, np.nan)
-
-    traces = [
-        go.Scatter3d(
-            x=ra, y=dec, z=dist,
-            mode="markers",
-            marker=dict(
-                size=5,
-                color=p,
-                colorscale=_plotly_membership_colorscale(cmap),
-                cmin=0.0, cmax=1.0,
-                colorbar=dict(title="P(member)", thickness=14, len=0.55, y=0.62),
-            ),
-            name="stars",
-            showlegend=False,
-            text=hover_names,
-            customdata=np.column_stack([va, vd, vr_hover, cluster_id, p]),
-            hovertemplate=(
-                "%{text}<br>"
-                "α = %{x:.3f} deg<br>"
-                "δ = %{y:.3f} deg<br>"
-                "d = 1/π = %{z:.3f} kpc<br>"
-                "v<sub>α*</sub> = %{customdata[0]:.2f} km/s<br>"
-                "v<sub>δ</sub> = %{customdata[1]:.2f} km/s<br>"
-                "v<sub>r</sub> = %{customdata[2]:.2f} km/s<br>"
-                "cluster = %{customdata[3]}<br>"
-                "P(member) = %{customdata[4]:.3f}<extra></extra>"
-            ),
+    hovertemplate = (
+        "%{text}<br>"
+        "α = %{x:.3f} deg<br>"
+        "δ = %{y:.3f} deg<br>"
+        "d = 1/ϖ = %{z:.3f} kpc<br>"
+        "v<sub>α*</sub> = %{customdata[0]:.2f} km/s<br>"
+        "v<sub>δ</sub> = %{customdata[1]:.2f} km/s<br>"
+        "v<sub>r</sub> = %{customdata[2]:.2f} km/s<br>"
+        "cluster = %{customdata[3]}<br>"
+        "P(member) = %{customdata[4]:.3f}<extra></extra>"
+    )
+    styles = _membership_styles(result, cmap)
+    n_styles = len(styles)
+    traces = []
+    dx = 0.055
+    x0 = 1.02
+    for i, (k, cm) in enumerate(styles):
+        mask = np.ones(len(ra), dtype=bool) if k is None else cluster_id == k
+        if not np.any(mask):
+            continue
+        marker = dict(
+            size=5,
+            color=p[mask],
+            colorscale=_plotly_membership_colorscale(cm),
+            cmin=0.0, cmax=1.0,
+            showscale=bool(show_colorbar),
         )
-    ]
+        if show_colorbar:
+            is_last = i == n_styles - 1
+            marker["colorbar"] = dict(
+                title=dict(text=_cluster_colorbar_number(i), side="top"),
+                thickness=14,
+                len=0.55,
+                y=0.5,
+                x=x0 + i * dx,
+                showticklabels=is_last,
+                ticks="outside" if is_last else "",
+            )
+        traces.append(go.Scatter3d(
+            x=ra[mask], y=dec[mask], z=dist[mask],
+            mode="markers",
+            marker=marker,
+            name="stars" if k is None else "lobe {}".format(int(k)),
+            showlegend=False,
+            text=hover_names[mask],
+            customdata=np.column_stack([
+                va[mask], vd[mask], vr_hover[mask], cluster_id[mask], p[mask],
+            ]),
+            hovertemplate=hovertemplate,
+        ))
     if np.any(out):
         traces.append(go.Scatter3d(
             x=ra[out], y=dec[out], z=dist[out],
@@ -887,7 +1728,7 @@ def plot_association_3d(
     show_vectors=True, head_size=0.02, view=(90, 210), traceback=None,
     n_frames=9, figsize=None, cmap=None, outlier_color=None,
 ):
-    """Interactive 3D sky plot: :math:`(\\alpha, \\delta, 1/\\pi)` with velocity arrows.
+    """Interactive 3D sky plot: :math:`(\\alpha, \\delta, 1/\\varpi)` with velocity arrows.
 
     Arrow length is a visual scale, not a physical displacement. Residual
     velocities (default) subtract the member mean so bulk motion does not
@@ -927,7 +1768,7 @@ def plot_association_3d(
     traces0, rms0, span0, v0 = _association_3d_traces(
         df, result, residual=residual, arrow_frac=arrow_frac,
         show_vectors=show_vectors, head_size=head_size, cmap=cmap,
-        outlier_color=outlier_color,
+        outlier_color=outlier_color, show_colorbar=True,
     )
 
     frame_traces = []
@@ -937,6 +1778,7 @@ def plot_association_3d(
             dft, result, residual=residual, arrow_frac=arrow_frac,
             show_vectors=show_vectors, head_size=head_size, cmap=cmap,
             outlier_color=outlier_color, global_span=span0, v0=v0,
+            show_colorbar=True,
         )
         frame_traces.append((t, traces, rms))
 
@@ -958,7 +1800,7 @@ def plot_association_3d(
     scene = dict(
         xaxis_title="α [deg]",
         yaxis_title="δ [deg]",
-        zaxis_title="d = 1/π [kpc]",
+        zaxis_title="d = 1/ϖ [kpc]",
         xaxis=dict(autorange="reversed"),
         aspectmode="cube",
         domain=dict(x=[0.0, 1.0], y=[0.12, 1.0]),
@@ -1031,6 +1873,19 @@ def plot_association_3d(
         layout["margin"] = dict(l=0, r=0, t=50, b=80)
 
     fig.update_layout(**layout)
+    n_cb = max(len(_lobe_ids(result)), 1)
+    fig.add_annotation(
+        text="P(member)",
+        x=1.02 + (n_cb - 1) * 0.055 + 0.07,
+        y=0.5,
+        xref="paper",
+        yref="paper",
+        textangle=90,
+        showarrow=False,
+        font=dict(size=14),
+        xanchor="left",
+        yanchor="middle",
+    )
     return fig
 
 

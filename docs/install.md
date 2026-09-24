@@ -29,7 +29,7 @@ pip install -e ".[dev]"
 Optional extras:
 
 - `dev` — pytest
-- `docs` — Sphinx, Furo, MyST
+- `docs` — Sphinx, Furo, MyST, MyST-NB (renders the example notebook)
 
 ## Build the documentation locally
 
@@ -38,4 +38,6 @@ pip install -e ".[docs]"
 sphinx-build -b html docs docs/_build/html
 ```
 
-Open `docs/_build/html/index.html`.
+Open `docs/_build/html/index.html`. The worked example page is built from
+`examples/example_systems.ipynb` (outputs are shown as saved; the notebook
+is not re-executed during the docs build).

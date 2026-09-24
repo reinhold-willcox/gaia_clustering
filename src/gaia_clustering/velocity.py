@@ -4,9 +4,9 @@ Generative model per star
 -------------------------
 Population velocities ``v = (vα, vδ[, vr]) ~ N(μ, Σ)``. Each star has a
 latent velocity drawn from that Gaussian (non-centered) and an independent
-latent distance with prior ``p(d) ∝ d²``; parallax is ``π = 1/d``.
-Proper motions are ``μα,δ = vα,δ π / 4.74047``, then compared to the
-Gaia observables ``(π, μα, μδ)`` with their 3×3 covariance.
+latent distance with prior ``p(d) ∝ d²``; parallax is ``ϖ = 1/d``.
+Proper motions are ``μα,δ = vα,δ ϖ / 4.74047``, then compared to the
+Gaia observables ``(ϖ, μα, μδ)`` with their 3×3 covariance.
 
 Radial velocity is optional per star. Stars with an independent RV
 measurement contribute a 1D Gaussian likelihood on ``vr``. Gaia RVs
@@ -20,9 +20,11 @@ import os
 import warnings
 from pathlib import Path
 
-# Keep PyTensor's compile cache in a writable project directory when
+from gaia_clustering.query import default_cache_dir
+
+# Keep PyTensor's compile cache in a writable user directory when
 # $HOME/.pytensor is locked or not writable (notebooks, sandboxes).
-_compiledir = Path.cwd() / "data" / "cache" / "pytensor"
+_compiledir = default_cache_dir() / "pytensor"
 try:
     _compiledir.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("PYTENSOR_FLAGS", "compiledir={}".format(_compiledir))
@@ -59,7 +61,7 @@ def _prepare_velocity_inputs(df, use_rv=None):
         ast_chol = np.linalg.cholesky(ast_cov)
     except np.linalg.LinAlgError as exc:
         raise ValueError(
-            "Each star's (π, μα, μδ) covariance must be positive definite"
+            "Each star's (ϖ, μα, μδ) covariance must be positive definite"
         ) from exc
 
     rv_mask = star_uses_rv(df) if use_rv is None else np.asarray(use_rv, dtype=bool)
@@ -116,7 +118,7 @@ def build_velocity_model(df, use_rv=None, parallax_bounds=None):
     use_rv : array-like of bool, optional
         Per-star RV inclusion. Default: stars with finite independent RV.
     parallax_bounds : (float, float), optional
-        ``(π_min, π_max)`` in mas for the volume-uniform distance prior.
+        ``(ϖ_min, ϖ_max)`` in mas for the volume-uniform distance prior.
         Defaults to a factor of four around the observed parallaxes.
 
     Returns
@@ -142,7 +144,7 @@ def build_velocity_model(df, use_rv=None, parallax_bounds=None):
     else:
         pi_min, pi_max = map(float, parallax_bounds)
     if not (0.0 < pi_min < pi_max):
-        raise ValueError("parallax_bounds must satisfy 0 < π_min < π_max")
+        raise ValueError("parallax_bounds must satisfy 0 < ϖ_min < ϖ_max")
     d_min = 1.0 / pi_max
     d_max = 1.0 / pi_min
     d_min3 = d_min ** 3
@@ -184,12 +186,12 @@ def build_velocity_model(df, use_rv=None, parallax_bounds=None):
             shape=n_stars,
             initval=d3_init,
         )
-        pi_true = pm.Deterministic("π_true", 1.0 / d3 ** (1.0 / 3.0))
+        pi_true = pm.Deterministic("ϖ_true", 1.0 / d3 ** (1.0 / 3.0))
 
         pmad_true = v_true[:, :2] * pi_true[:, None] / AU_KMS
         predicted_ast = pt.concatenate([pi_true[:, None], pmad_true], axis=1)
         pm.MvNormal(
-            "Likelihood(π,μα,μδ)",
+            "Likelihood(ϖ,μα,μδ)",
             mu=predicted_ast,
             chol=ast_chol,
             observed=ast_means,
@@ -324,7 +326,7 @@ def fit_velocity_dispersion(
         Member stars.
     use_rv : array-like of bool, optional
     parallax_bounds : tuple of float, optional
-        ``(π_min, π_max)`` in mas.
+        ``(ϖ_min, ϖ_max)`` in mas.
     draws, tune, chains, cores, target_accept, random_seed, return_inferencedata
         Forwarded to :func:`sample_velocity_model`.
 

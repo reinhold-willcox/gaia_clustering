@@ -30,15 +30,31 @@ def build_parser():
         "--rv-file",
         help="CSV of independent radial velocities (Gaia RVs are ignored)",
     )
-    p.add_argument("--radius", type=float, default=1.5, help="Cone radius in degrees")
-    p.add_argument("--g-max", type=float, default=13.0, help="Gaia G magnitude limit")
-    p.add_argument("--ruwe-max", type=float, default=1.4)
-    p.add_argument("--plx-snr-min", type=float, default=5.0)
+    p.add_argument("--radius", type=float, default=10.0, help="Cone radius in arcminutes")
+    p.add_argument("--g-max", type=float, default=20.0, help="Gaia G magnitude limit")
+    p.add_argument(
+        "--parallax-range",
+        type=float,
+        nargs=2,
+        metavar=("LO", "HI"),
+        default=None,
+        help="Hard parallax limits in mas (optional)",
+    )
     p.add_argument(
         "--threshold",
         type=float,
         default=0.5,
         help="P(member) cut for hard membership and the velocity fit",
+    )
+    p.add_argument(
+        "--velocity-cluster-id",
+        type=int,
+        default=None,
+        metavar="ID",
+        help=(
+            "Spatial lobe (cluster_id) for the velocity fit; required when "
+            "preferred_K > 1 (matches membership table / colorbar label − 1)"
+        ),
     )
     p.add_argument(
         "--no-velocity",
@@ -66,7 +82,7 @@ def build_parser():
     p.add_argument(
         "--cache-dir",
         default=None,
-        help="Gaia TAP cache directory (default: data/cache)",
+        help="Gaia TAP cache directory (default: ~/.cache/gaia_clustering)",
     )
     return p
 
@@ -94,12 +110,12 @@ def main(argv=None):
         name=args.name,
         catalog=args.catalog,
         rv_path=args.rv_file,
-        radius_deg=args.radius,
+        position_radius_arcmin=args.radius,
         g_max=args.g_max,
-        ruwe_max=args.ruwe_max,
-        plx_snr_min=args.plx_snr_min,
+        parallax_range=None if args.parallax_range is None else tuple(args.parallax_range),
         membership_probability_threshold=args.threshold,
         infer_velocity=not args.no_velocity,
+        velocity_cluster_id=args.velocity_cluster_id,
         velocity_draws=args.draws,
         velocity_chains=args.chains,
         velocity_cores=args.cores,

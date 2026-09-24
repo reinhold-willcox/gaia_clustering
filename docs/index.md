@@ -1,7 +1,22 @@
-# gaia_clustering documentation
+# gaia_clustering
 
-Gaia membership and hierarchical velocity-dispersion pipeline for stellar
-associations.
+<div class="gc-hero" markdown="1">
+
+<p class="gc-brand">gaia_clustering</p>
+
+<p class="gc-lede">
+Query Gaia around a stellar association, separate members from the field with
+extreme deconvolution, and fit a hierarchical velocity Gaussian — with clear
+inspection plots at every step.
+</p>
+
+<div class="gc-actions">
+<a class="gc-btn gc-btn-primary" href="install.html">Install</a>
+<a class="gc-btn gc-btn-secondary" href="usage.html">Usage</a>
+<a class="gc-btn gc-btn-secondary" href="example_systems.html">Worked example</a>
+</div>
+
+</div>
 
 ```{toctree}
 :maxdepth: 2
@@ -10,6 +25,7 @@ associations.
 install
 usage
 method
+example_systems
 ```
 
 ```{toctree}
@@ -19,23 +35,68 @@ method
 api
 ```
 
-## What it does
+## Pipeline at a glance
 
-1. Resolve a cluster, association, or star with CDS Sesame / SIMBAD.
-2. Query Gaia DR3 around that position in a **preview** cone (larger than
-   the selected radius) so the cone and parallax window can be checked
-   with {func}`~gaia_clustering.plots.plot_query`. **Gaia radial velocities are ignored.**
-3. Separate members from field stars with extreme deconvolution in 6D
-   ICRS phase space ([Bovy, Hogg & Roweis 2011](https://ui.adsabs.harvard.edu/abs/2011AnA...543A.106B)).
-4. Infer the member velocity Gaussian with hierarchical Bayesian sampling.
-5. Plot sky membership, a 5D/6D corner, and an interactive 3D traceback.
+<div class="gc-steps" markdown="1">
+
+<div class="gc-step" markdown="1">
+
+**1. Query**
+
+Resolve a name with Sesame / SIMBAD and download a Gaia DR3 neighbourhood.
+
+</div>
+
+<div class="gc-step" markdown="1">
+
+**2. Refine**
+
+Tighten sky, proper-motion, and parallax cuts in memory; inspect with `plot_query`.
+
+</div>
+
+<div class="gc-step" markdown="1">
+
+**3. Members**
+
+Extreme deconvolution in 6D phase space separates the association from the field.
+
+</div>
+
+<div class="gc-step" markdown="1">
+
+**4. Lobes**
+
+Compare spatial $K$ by BIC. When $K>1$, pick one lobe for the velocity fit.
+
+</div>
+
+<div class="gc-step" markdown="1">
+
+**5. Velocity**
+
+Hierarchical Bayesian sampling of the member velocity Gaussian (PyMC / NUTS).
+
+</div>
+
+</div>
+
+**Gaia radial velocities are never used.** Independently measured RVs can be attached per star.
 
 ```python
 from gaia_clustering import query_association, analyze_association
 
-query = query_association("Cyg OB3", radius_deg=1.5, g_max=12)
+query = query_association("Cyg OB3", position_radius_arcmin=10, g_max=20)
+query.refine_search(parallax_range=(2.0, 8.0))
 query.plot_query()
-result = analyze_association(query)
+
+result = analyze_association(query)          # single lobe: no extra arg
+# result = analyze_association(query, velocity_cluster_id=0)  # required if K > 1
+
 print(result.summary())
+result.plot_summary()
 result.plot_3d(traceback=(0, 10))
 ```
+
+See the {doc}`worked example <example_systems>` notebook for a full end-to-end run,
+and {doc}`method` for the membership and velocity models.

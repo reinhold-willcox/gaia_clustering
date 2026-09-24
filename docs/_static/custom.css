@@ -1,0 +1,135 @@
+@import url("https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&family=IBM+Plex+Mono:wght@400;500&family=Source+Sans+3:wght@400;600;700&display=swap");
+
+:root {
+  --gc-ink: #12252b;
+  --gc-muted: #4a636b;
+  --gc-accent: #0f4c5c;
+  --gc-accent-soft: #d7ecef;
+  --gc-wash: linear-gradient(165deg, #f7fbfc 0%, #e8f2f4 48%, #f4f0e8 100%);
+}
+
+body {
+  font-feature-settings: "ss01" on, "kern" on;
+}
+
+.gc-hero {
+  position: relative;
+  margin: 0 0 2.5rem;
+  padding: 2.4rem 2rem 2.2rem;
+  border-radius: 1.1rem;
+  background: var(--gc-wash);
+  border: 1px solid rgba(15, 76, 92, 0.12);
+  overflow: hidden;
+}
+
+.gc-hero::before {
+  content: "";
+  position: absolute;
+  inset: auto -10% -40% 40%;
+  height: 18rem;
+  background:
+    radial-gradient(circle at 30% 40%, rgba(15, 76, 92, 0.16), transparent 55%),
+    radial-gradient(circle at 70% 60%, rgba(176, 120, 56, 0.14), transparent 50%);
+  pointer-events: none;
+}
+
+.gc-hero > * {
+  position: relative;
+  z-index: 1;
+}
+
+.gc-hero .gc-brand {
+  margin: 0 0 0.55rem;
+  font-family: "Fraunces", Georgia, serif;
+  font-size: clamp(2.1rem, 4vw, 2.9rem);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--gc-accent);
+  line-height: 1.05;
+}
+
+.gc-hero .gc-lede {
+  max-width: 40rem;
+  margin: 0 0 1.25rem;
+  font-size: 1.12rem;
+  line-height: 1.55;
+  color: var(--gc-muted);
+}
+
+.gc-hero .gc-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.7rem;
+}
+
+.gc-hero a.gc-btn {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.55rem 1rem;
+  border-radius: 999px;
+  font-weight: 600;
+  text-decoration: none;
+  border: 1px solid transparent;
+}
+
+.gc-hero a.gc-btn-primary {
+  background: var(--gc-accent);
+  color: #fff !important;
+}
+
+.gc-hero a.gc-btn-secondary {
+  background: rgba(255, 255, 255, 0.72);
+  color: var(--gc-accent) !important;
+  border-color: rgba(15, 76, 92, 0.18);
+}
+
+.gc-steps {
+  display: grid;
+  gap: 0.9rem;
+  margin: 1.5rem 0 2rem;
+}
+
+@media (min-width: 760px) {
+  .gc-steps {
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+  }
+}
+
+.gc-step {
+  padding: 1rem 0.95rem 1.05rem;
+  border-radius: 0.85rem;
+  background: rgba(15, 76, 92, 0.04);
+  border: 1px solid rgba(15, 76, 92, 0.08);
+}
+
+.gc-step strong {
+  display: block;
+  margin-bottom: 0.35rem;
+  color: var(--gc-accent);
+  font-size: 0.92rem;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.gc-step p {
+  margin: 0;
+  color: var(--gc-muted);
+  font-size: 0.95rem;
+  line-height: 1.45;
+}
+
+/* Notebooks: tighten code cells and keep figures readable */
+div.cell_input,
+div.cell_output {
+  border-radius: 0.55rem;
+}
+
+div.cell_output img {
+  max-width: 100%;
+  height: auto;
+  border-radius: 0.4rem;
+}
+
+article .content-icon {
+  opacity: 0.85;
+}

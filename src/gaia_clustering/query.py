@@ -8,15 +8,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import warnings
 import xml.etree.ElementTree as ET
 from io import BytesIO
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 import numpy as np
 import pandas as pd
+import astropy.units as u
+from astropy.coordinates import SkyCoord
 from astropy.table import Table
 from astropy.utils.data import download_file, get_file_contents
 
@@ -24,7 +28,36 @@ SESAME_URL = "https://cds.unistra.fr/cgi-bin/nph-sesame/-oxpI/SNV?"
 GAIA_TAP_SYNC = "https://gea.esac.esa.int/tap-server/tap/sync"
 SIMBAD_TAP_SYNC = "https://simbad.cds.unistra.fr/simbad/sim-tap/sync"
 
-DEFAULT_CACHE_DIR = Path.cwd() / "data" / "cache"
+
+class NameResolutionError(ValueError):
+    """CDS Sesame/SIMBAD could not resolve a target name."""
+
+
+class GaiaQueryError(RuntimeError):
+    """A Gaia TAP request failed."""
+
+
+def default_cache_dir():
+    """Return the default directory for pickled Gaia TAP results.
+
+    Honours ``GAIA_CLUSTERING_CACHE``, then ``$XDG_CACHE_HOME/gaia_clustering``,
+    then ``~/.cache/gaia_clustering``. Callers do not need to pass a cache path.
+    """
+    env = os.environ.get("GAIA_CLUSTERING_CACHE")
+    if env:
+        return Path(env).expanduser()
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    base = Path(xdg).expanduser() if xdg else Path.home() / ".cache"
+    return base / "gaia_clustering"
+
+
+def _resolve_cache_dir(cache_dir):
+    """``None`` → :func:`default_cache_dir`; ``False`` disables caching."""
+    if cache_dir is False:
+        return None
+    if cache_dir is None:
+        return default_cache_dir()
+    return Path(cache_dir)
 
 # SIMBAD otypes that are groups rather than individual stars.
 _GROUP_OTYPES = {
@@ -120,9 +153,28 @@ def gaia_tap_query(adql, timeout=300, cache_dir=None):
         }
     ).encode("utf-8")
     request = Request(GAIA_TAP_SYNC, data=payload)
-    with urlopen(request, timeout=timeout) as response:
-        votable_bytes = response.read()
-    table = Table.read(BytesIO(votable_bytes), format="votable")
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            votable_bytes = response.read()
+    except HTTPError as exc:
+        if exc.code == 408:
+            raise GaiaQueryError(
+                "Gaia TAP timed out (HTTP 408). The cone search is probably too "
+                "large or too crowded. Try a smaller position_radius_arcmin or a brighter "
+                "g_max."
+            ) from exc
+        raise GaiaQueryError(
+            "Gaia TAP request failed (HTTP {}): {}".format(exc.code, exc.reason)
+        ) from exc
+    except (TimeoutError, URLError) as exc:
+        raise GaiaQueryError("Gaia TAP request failed: {}".format(exc)) from exc
+    try:
+        table = Table.read(BytesIO(votable_bytes), format="votable")
+    except Exception as exc:
+        raise GaiaQueryError(
+            "Gaia TAP returned a response that could not be parsed as a table: "
+            "{}".format(exc)
+        ) from exc
     df = table.to_pandas()
     df.columns = [c.lower() for c in df.columns]
     if cache_path is not None:
@@ -132,7 +184,12 @@ def gaia_tap_query(adql, timeout=300, cache_dir=None):
 
 def _sesame_xml(name):
     url = SESAME_URL + quote(name, safe="")
-    text = get_file_contents(download_file(url, cache=True, show_progress=False))
+    try:
+        text = get_file_contents(download_file(url, cache=True, show_progress=False))
+    except Exception as exc:
+        raise NameResolutionError(
+            "Could not resolve {!r} via CDS Sesame/SIMBAD: {}".format(name, exc)
+        ) from exc
     return text.split("<!---")[0]
 
 
@@ -175,8 +232,13 @@ def resolve_name(name):
     }
     try:
         root = ET.fromstring(_sesame_xml(name))
-    except ET.ParseError:
-        return result
+    except NameResolutionError:
+        raise
+    except ET.ParseError as exc:
+        raise NameResolutionError(
+            "Could not parse the CDS Sesame response for {!r}. "
+            "The name may be unrecognized, or the resolver returned invalid XML.".format(name)
+        ) from exc
 
     resolver = None
     for node in root.findall(".//Resolver"):
@@ -224,13 +286,26 @@ def query_gaia_by_source_ids(source_ids, cache_dir=None):
     return gaia_tap_query(adql, cache_dir=cache_dir)
 
 
+def arcmin_to_deg(radius_arcmin):
+    """Convert a cone radius from arcminutes to degrees."""
+    return float(radius_arcmin) / 60.0
+
+
+def _as_float_or_none(value):
+    if value is None:
+        return None
+    return float(value)
+
+
 def query_gaia_cone(
     ra_deg,
     dec_deg,
-    radius_deg=1.5,
-    g_max=13.0,
-    ruwe_max=1.4,
-    plx_snr_min=5.0,
+    radius_arcmin=10,
+    g_max=20,
+    ruwe_max=None,
+    plx_snr_min=None,
+    parallax_lo=None,
+    parallax_hi=None,
     visibility_min=8,
     top=10000,
     cache_dir=None,
@@ -243,14 +318,17 @@ def query_gaia_cone(
     ----------
     ra_deg, dec_deg : float
         Cone centre (ICRS, degrees).
-    radius_deg : float
-        Search radius in degrees.
-    g_max : float
-        Faint *G* magnitude limit.
-    ruwe_max : float
-        Maximum RUWE.
-    plx_snr_min : float
-        Minimum ``parallax_over_error``.
+    radius_arcmin : float
+        Search radius in arcminutes.
+    g_max : float or None
+        Faint *G* magnitude limit. ``None`` skips the cut.
+    ruwe_max : float or None
+        Maximum RUWE. ``None`` (default) skips the cut.
+    plx_snr_min : float or None
+        Minimum ``parallax_over_error``. ``None`` (default) skips the cut.
+    parallax_lo, parallax_hi : float or None
+        Inclusive parallax limits in mas for the TAP query. ``None``
+        skips that bound (aside from ``parallax > 0``).
     visibility_min : int
         Minimum ``visibility_periods_used``.
     top : int
@@ -262,71 +340,420 @@ def query_gaia_cone(
     -------
     pandas.DataFrame
     """
+    radius_deg = arcmin_to_deg(radius_arcmin)
     cols = ", ".join(GAIA_COLUMNS)
-    adql = f"""
-    SELECT TOP {int(top)} {cols}
-    FROM gaiadr3.gaia_source
-    WHERE 1 = CONTAINS(
-        POINT('ICRS', ra, dec),
-        CIRCLE('ICRS', {float(ra_deg)}, {float(dec_deg)}, {float(radius_deg)})
-    )
-    AND phot_g_mean_mag < {float(g_max)}
-    AND parallax IS NOT NULL
-    AND parallax > 0
-    AND pmra IS NOT NULL
-    AND pmdec IS NOT NULL
-    AND parallax_error > 0
-    AND pmra_error > 0
-    AND pmdec_error > 0
-    AND ruwe < {float(ruwe_max)}
-    AND parallax_over_error > {float(plx_snr_min)}
-    AND visibility_periods_used > {int(visibility_min)}
-    """
+    where = [
+        "1 = CONTAINS(POINT('ICRS', ra, dec), "
+        "CIRCLE('ICRS', {ra}, {dec}, {rad}))".format(
+            ra=float(ra_deg), dec=float(dec_deg), rad=float(radius_deg),
+        ),
+        "parallax IS NOT NULL",
+        "parallax > 0",
+        "pmra IS NOT NULL",
+        "pmdec IS NOT NULL",
+        "parallax_error > 0",
+        "pmra_error > 0",
+        "pmdec_error > 0",
+        "visibility_periods_used > {}".format(int(visibility_min)),
+    ]
+    if g_max is not None:
+        where.append("phot_g_mean_mag < {}".format(float(g_max)))
+    if ruwe_max is not None:
+        where.append("ruwe < {}".format(float(ruwe_max)))
+    if plx_snr_min is not None:
+        where.append("parallax_over_error > {}".format(float(plx_snr_min)))
+    if parallax_lo is not None:
+        where.append("parallax >= {}".format(float(parallax_lo)))
+    if parallax_hi is not None:
+        where.append("parallax <= {}".format(float(parallax_hi)))
+    adql = (
+        "SELECT TOP {top} {cols}\n"
+        "FROM gaiadr3.gaia_source\n"
+        "WHERE {where}\n"
+    ).format(top=int(top), cols=cols, where="\n    AND ".join(where))
     df = gaia_tap_query(adql, cache_dir=cache_dir)
     if "source_id" in df.columns and len(df):
         df["source_id"] = df["source_id"].astype("int64")
     if len(df) >= int(top):
         warnings.warn(
-            "Gaia cone returned TOP={} rows; tighten --g-max/--radius or raise top".format(top),
+            "Gaia cone returned TOP={} rows; tighten g_max/radius or raise top".format(top),
             RuntimeWarning,
             stacklevel=2,
         )
     return df
 
 
-def apply_parallax_window(df, pi0, frac_lo=0.4, frac_hi=2.5):
-    """Keep stars whose parallax lies in ``[frac_lo, frac_hi] * pi0``.
+PARALLAX_PREVIEW_LO_FACTOR = 0.75
+PARALLAX_PREVIEW_HI_FACTOR = 1.5
 
-    Parameters
-    ----------
-    df : DataFrame
-        Must contain ``parallax`` (mas).
-    pi0 : float
-        Reference parallax (mas). Non-positive values return ``df`` unchanged.
-    frac_lo, frac_hi : float
-        Multiplicative window edges.
+
+def _mean_positive_parallax(df):
+    if df is None or len(df) == 0 or "parallax" not in getattr(df, "columns", []):
+        return None
+    plx = np.asarray(df["parallax"], dtype=float)
+    plx = plx[np.isfinite(plx) & (plx > 0)]
+    if plx.size == 0:
+        return None
+    return float(np.mean(plx))
+
+
+def _as_cut_pair(value, name):
+    if value is None:
+        return None
+    seq = tuple(value)
+    if len(seq) != 2:
+        raise ValueError("{} must be a (lo, hi) pair".format(name))
+    lo, hi = float(seq[0]), float(seq[1])
+    if not (np.isfinite(lo) and np.isfinite(hi) and hi >= lo):
+        raise ValueError("{} must satisfy lo <= hi with finite values".format(name))
+    return (lo, hi)
+
+
+def resolve_reference_parallax(kind, seed, in_cone):
+    """Reference ϖ: the submitted star, otherwise the mean in the cone."""
+    if kind != "group" and seed is not None and len(seed) and "parallax" in seed.columns:
+        pi = float(seed["parallax"].iloc[0])
+        if np.isfinite(pi) and pi > 0:
+            return pi, "star"
+    pi = _mean_positive_parallax(in_cone)
+    if pi is None:
+        return None, None
+    return pi, "cone_mean"
+
+
+def resolved_parallax_bounds(info):
+    """Absolute parallax cut ``(lo, hi)`` in mas, or ``None`` if disabled."""
+    for key in ("parallax_range", "parallax_cuts"):
+        cuts = _as_cut_pair(info.get(key), key)
+        if cuts is not None:
+            return cuts
+    window = info.get("parallax_window")
+    pi0 = info.get("reference_parallax")
+    if window is None or pi0 is None:
+        return None
+    lo, hi = float(window[0]), float(window[1])
+    pi0 = float(pi0)
+    if not (np.isfinite(pi0) and pi0 > 0):
+        return None
+    return (lo * pi0, hi * pi0)
+
+
+def preview_parallax_bounds(
+    bounds,
+    lo_fac=PARALLAX_PREVIEW_LO_FACTOR,
+    hi_fac=PARALLAX_PREVIEW_HI_FACTOR,
+):
+    """Widen accepted parallax cuts for the Gaia search / preview sample."""
+    if bounds is None:
+        return None
+    lo, hi = bounds
+    return (float(lo_fac) * float(lo), float(hi_fac) * float(hi))
+
+
+def parallax_bounds_mask(df, bounds):
+    """Boolean mask for stars inside absolute parallax bounds (mas)."""
+    if bounds is None:
+        return np.ones(len(df), dtype=bool)
+    lo, hi = bounds
+    plx = np.asarray(df["parallax"], dtype=float)
+    return (plx >= lo) & (plx <= hi)
+
+
+def parse_position_center(position_center):
+    """Parse an ICRS RA/Dec into degrees.
+
+    Accepts a :class:`~astropy.coordinates.SkyCoord`, an ``(ra, dec)``
+    pair in degrees, or a string in the usual Gaia / Astropy forms
+    (decimal degrees, ``hh:mm:ss ±dd:mm:ss``, ``XXhYYmZZs ±AAdBBmCCs``).
 
     Returns
     -------
-    pandas.DataFrame
+    ra, dec : float
+        ICRS right ascension and declination in degrees.
     """
-    pi0 = float(pi0)
-    if not np.isfinite(pi0) or pi0 <= 0:
+    if position_center is None:
+        raise ValueError("position_center is empty")
+    if isinstance(position_center, SkyCoord):
+        c = position_center.icrs
+        return float(c.ra.deg), float(c.dec.deg)
+    if isinstance(position_center, (tuple, list, np.ndarray)):
+        if len(position_center) != 2:
+            raise ValueError("position_center must be RA and Dec")
+        ra_i, dec_i = position_center
+        try:
+            ra, dec = float(ra_i), float(dec_i)
+        except (TypeError, ValueError):
+            return parse_position_center("{} {}".format(ra_i, dec_i))
+        if np.isfinite(ra) and np.isfinite(dec):
+            return ra, dec
+        raise ValueError("position_center RA/Dec must be finite")
+    s = " ".join(str(position_center).replace(",", " ").split())
+    if not s:
+        raise ValueError("position_center is empty")
+    low = s.lower()
+    looks_sexagesimal = (
+        "h" in low or ":" in s or ("d" in low and "m" in low)
+    )
+    attempts = []
+    if looks_sexagesimal:
+        attempts.extend((
+            lambda: SkyCoord(s),
+            lambda: SkyCoord(s, unit=(u.hourangle, u.deg)),
+            lambda: SkyCoord(s, unit=u.deg),
+        ))
+    else:
+        attempts.extend((
+            lambda: SkyCoord(s, unit=u.deg),
+            lambda: SkyCoord(s),
+            lambda: SkyCoord(s, unit=(u.hourangle, u.deg)),
+        ))
+    last_err = None
+    for build in attempts:
+        try:
+            c = build().icrs
+            ra, dec = float(c.ra.deg), float(c.dec.deg)
+        except Exception as exc:
+            last_err = exc
+            continue
+        if np.isfinite(ra) and np.isfinite(dec):
+            return ra, dec
+    raise ValueError(
+        "Could not parse position_center={!r} as ICRS RA/Dec. "
+        "Try decimal degrees ('308.11 +41.23'), sexagesimal "
+        "('20h32m25.8s +41d18m31s'), or a 2-tuple of degrees.".format(
+            position_center,
+        )
+    ) from last_err
+
+
+def search_center(info):
+    """RA/Dec (degrees) of the cone used for the Gaia search."""
+    ra = info.get("center_ra", info.get("simbad_ra"))
+    dec = info.get("center_dec", info.get("simbad_dec"))
+    if ra is None or dec is None or not np.isfinite(ra) or not np.isfinite(dec):
+        raise ValueError("query metadata is missing a cone center")
+    return float(ra), float(dec)
+
+
+def name_position(info):
+    """RA/Dec (degrees) resolved from the target name (SIMBAD/Sesame)."""
+    ra = info.get("simbad_ra")
+    dec = info.get("simbad_dec")
+    if ra is None or dec is None or not np.isfinite(ra) or not np.isfinite(dec):
+        return None
+    return float(ra), float(dec)
+
+
+def apply_query_cuts(extended, info, seed=None):
+    """Apply the selected sky, proper-motion, and parallax cuts; update ``info``.
+
+    Accepted stars lie inside the on-sky cone, the proper-motion cone
+    (when ``pm_radius`` is set), *and* the parallax range (when set).
+    The reference parallax is the submitted star when available;
+    otherwise the mean of stars in the on-sky cone.
+    """
+    ra0, dec0 = search_center(info)
+    in_cone = subset_cone(extended, ra0, dec0, info["radius_deg"])
+    if seed is None:
+        sid = info.get("gaia_source_id")
+        if sid is not None and "source_id" in extended.columns:
+            match = extended.loc[extended["source_id"] == sid]
+            if len(match):
+                seed = match
+    if info.get("pm_center") is None:
+        info["pm_center"] = default_pm_center(extended, info, seed=seed)
+    if info.get("reference_parallax_source") != "star":
+        pi0, source = resolve_reference_parallax(info.get("kind"), seed, in_cone)
+        info["reference_parallax"] = pi0
+        info["reference_parallax_source"] = source
+    bounds = resolved_parallax_bounds(info)
+    if bounds is not None:
+        keep = parallax_bounds_mask(in_cone, bounds)
+        info["parallax_lo_mas"] = float(bounds[0])
+        info["parallax_hi_mas"] = float(bounds[1])
+        preview = preview_parallax_bounds(bounds)
+        info["parallax_preview_lo_mas"] = float(preview[0])
+        info["parallax_preview_hi_mas"] = float(preview[1])
+    else:
+        keep = np.ones(len(in_cone), dtype=bool)
+        info["parallax_lo_mas"] = None
+        info["parallax_hi_mas"] = None
+        info["parallax_preview_lo_mas"] = None
+        info["parallax_preview_hi_mas"] = None
+    keep = np.asarray(keep, dtype=bool) & proper_motion_mask(in_cone, info)
+    catalog = in_cone.iloc[np.flatnonzero(keep)].copy()
+    info["n_cone"] = int(len(in_cone))
+    info["n_pm"] = int(proper_motion_mask(extended, info).sum()) if len(extended) else 0
+    info["n_catalog"] = int(len(catalog))
+    return catalog
+
+
+def parse_pm_center(pm_center):
+    """Parse ``(pmra, pmdec)`` in mas/yr."""
+    if pm_center is None:
+        raise ValueError("pm_center is empty")
+    if not isinstance(pm_center, (tuple, list, np.ndarray)) or len(pm_center) != 2:
+        raise ValueError("pm_center must be (pmra, pmdec) in mas/yr")
+    pmra, pmdec = float(pm_center[0]), float(pm_center[1])
+    if not (np.isfinite(pmra) and np.isfinite(pmdec)):
+        raise ValueError("pm_center must be finite")
+    return pmra, pmdec
+
+
+def default_pm_center(df, info, seed=None):
+    """Seed-star proper motion, else the median of the position cone."""
+    if seed is not None and len(seed) and "pmra" in seed.columns:
+        row = seed.iloc[0]
+        if np.isfinite(row["pmra"]) and np.isfinite(row["pmdec"]):
+            return float(row["pmra"]), float(row["pmdec"])
+    sid = info.get("gaia_source_id")
+    if sid is not None and df is not None and "source_id" in df.columns:
+        match = df.loc[df["source_id"] == sid]
+        if len(match):
+            row = match.iloc[0]
+            if np.isfinite(row.get("pmra", np.nan)) and np.isfinite(row.get("pmdec", np.nan)):
+                return float(row["pmra"]), float(row["pmdec"])
+    if df is None or len(df) == 0 or "pmra" not in df.columns:
+        return None
+    try:
+        ra0, dec0 = search_center(info)
+        cone = subset_cone(df, ra0, dec0, info.get("radius_deg") or 0.0)
+    except (KeyError, ValueError):
+        cone = df
+    pmra = np.asarray(cone["pmra"], dtype=float)
+    pmdec = np.asarray(cone["pmdec"], dtype=float)
+    ok = np.isfinite(pmra) & np.isfinite(pmdec)
+    if not np.any(ok):
+        return None
+    return float(np.median(pmra[ok])), float(np.median(pmdec[ok]))
+
+
+def proper_motion_mask(df, info):
+    """Boolean mask for the proper-motion cone, or all-True if unset."""
+    radius = info.get("pm_radius")
+    center = info.get("pm_center")
+    if (
+        df is None or len(df) == 0 or radius is None or center is None
+        or not np.isfinite(radius) or float(radius) <= 0
+        or "pmra" not in df.columns or "pmdec" not in df.columns
+    ):
+        return np.ones(0 if df is None else len(df), dtype=bool)
+    pmra = np.asarray(df["pmra"], dtype=float)
+    pmdec = np.asarray(df["pmdec"], dtype=float)
+    d = np.hypot(pmra - float(center[0]), pmdec - float(center[1]))
+    return np.isfinite(d) & (d <= float(radius))
+
+
+def wrap_ra_deg(ra, ra0):
+    """Shift right ascension so it is continuous around ``ra0`` (degrees)."""
+    ra = np.asarray(ra, dtype=float)
+    ra0 = float(ra0)
+    return ra0 + ((ra - ra0 + 180.0) % 360.0 - 180.0)
+
+
+def on_sky_separation_deg(ra, dec, ra0, dec0):
+    """Great-circle separation in degrees from ``(ra0, dec0)``."""
+    ra = np.asarray(ra, dtype=float)
+    dec = np.asarray(dec, dtype=float)
+    if ra.size == 0:
+        return np.empty(0, dtype=float)
+    coords = SkyCoord(ra * u.deg, dec * u.deg, frame="icrs")
+    center = SkyCoord(float(ra0) * u.deg, float(dec0) * u.deg, frame="icrs")
+    return np.asarray(coords.separation(center).deg, dtype=float)
+
+
+def subset_cone(df, ra0, dec0, radius_deg):
+    """Keep rows whose on-sky position lies inside the cone."""
+    if df is None or len(df) == 0:
+        return df.copy() if df is not None else df
+    sep = on_sky_separation_deg(df["ra"], df["dec"], ra0, dec0)
+    return df.loc[sep <= float(radius_deg)].copy()
+
+
+def sky_circle_radec(ra0, dec0, radius_deg, n=256):
+    """ICRS ``(ra, dec)`` vertices of a spherical cone boundary."""
+    center = SkyCoord(float(ra0) * u.deg, float(dec0) * u.deg, frame="icrs")
+    pa = np.linspace(0.0, 360.0, int(n)) * u.deg
+    circ = center.directional_offset_by(pa, float(radius_deg) * u.deg)
+    return np.asarray(circ.ra.deg, dtype=float), np.asarray(circ.dec.deg, dtype=float)
+
+
+def cone_mask(df, ra0, dec0, radius_deg):
+    """Boolean mask for :func:`subset_cone`."""
+    if df is None or len(df) == 0:
+        return np.ones(0, dtype=bool)
+    sep = on_sky_separation_deg(df["ra"], df["dec"], ra0, dec0)
+    return sep <= float(radius_deg)
+
+
+def _drop_gaia_rv_columns(df):
+    for col in ("radial_velocity", "radial_velocity_error"):
+        if col in df.columns:
+            df = df.drop(columns=[col])
+    return df
+
+
+def _merge_seed(df, seed):
+    if seed is None or len(seed) == 0 or "source_id" not in df.columns:
         return df
-    plx = np.asarray(df["parallax"], dtype=float)
-    keep = (plx >= frac_lo * pi0) & (plx <= frac_hi * pi0)
-    return df.loc[keep].copy()
+    missing = ~seed["source_id"].isin(df["source_id"])
+    if missing.any():
+        df = pd.concat([df, seed.loc[missing]], ignore_index=True)
+    return df
+
+
+def _accepted_bounds_before_tap(kind, seed, parallax_window, parallax_cuts):
+    """Accepted ϖ cuts if they can be known before the cone search."""
+    info = {
+        "kind": kind,
+        "parallax_window": None if parallax_window is None else tuple(parallax_window),
+        "parallax_cuts": _as_cut_pair(parallax_cuts, "parallax_cuts"),
+        "reference_parallax": None,
+        "reference_parallax_source": None,
+    }
+    pi0, source = resolve_reference_parallax(kind, seed, None)
+    if pi0 is not None:
+        info["reference_parallax"] = pi0
+        info["reference_parallax_source"] = source
+    return resolved_parallax_bounds(info)
+
+
+def _load_cone(
+    resolved, seed, radius_arcmin, g_max, ruwe_max, plx_snr_min, top, cache_dir,
+    parallax_lo=None, parallax_hi=None, ra=None, dec=None,
+):
+    if ra is None:
+        ra = resolved["simbad_ra"]
+    if dec is None:
+        dec = resolved["simbad_dec"]
+    df = query_gaia_cone(
+        ra,
+        dec,
+        radius_arcmin=radius_arcmin,
+        g_max=g_max,
+        ruwe_max=ruwe_max,
+        plx_snr_min=plx_snr_min,
+        parallax_lo=parallax_lo,
+        parallax_hi=parallax_hi,
+        top=top,
+        cache_dir=cache_dir,
+    )
+    df = _merge_seed(df, seed)
+    if "source_id" in df.columns:
+        df = df.drop_duplicates(subset=["source_id"])
+    return _drop_gaia_rv_columns(df.reset_index(drop=True))
 
 
 def fetch_neighbourhood(
     name,
-    radius_deg=1.5,
-    g_max=13.0,
-    ruwe_max=1.4,
-    plx_snr_min=5.0,
-    parallax_window=(0.4, 2.5),
-    cache_dir=DEFAULT_CACHE_DIR,
+    position_radius_arcmin=10,
+    g_max=20,
+    parallax_range=None,
+    cache_dir=None,
     top=10000,
+    return_extended=False,
+    ruwe_max=None,
+    plx_snr_min=None,
 ):
     """Resolve ``name`` and return a Gaia DR3 neighbourhood.
 
@@ -334,34 +761,55 @@ def fetch_neighbourhood(
     ----------
     name : str
         Cluster/association name, or a star in the association.
-    radius_deg : float
-        Cone radius in degrees.
-    g_max : float
-        Faint *G* magnitude limit.
-    ruwe_max : float
-        Maximum RUWE.
-    plx_snr_min : float
-        Minimum ``parallax_over_error``.
-    parallax_window : tuple of float or None
-        Multiplicative parallax window around a resolved star's parallax
-        (ignored for groups with no Gaia source). ``None`` disables the cut.
-    cache_dir : path-like or None
-        Directory for pickled TAP results. ``None`` disables caching.
+    position_radius_arcmin : float
+        TAP cone radius in arcminutes, centred on the name-resolved
+        coordinates.
+    g_max : float or None
+        Faint *G* magnitude limit. ``None`` skips the cut.
+    parallax_range : tuple of float or None
+        Hard TAP parallax limits in mas, ``(lo, hi)``. ``None``
+        (default) does not filter on parallax.
+    cache_dir : path-like, False, or None
+        Directory for pickled TAP results. ``None`` (default) uses
+        :func:`default_cache_dir`. ``False`` disables caching.
     top : int
         Maximum cone-search rows.
+    return_extended : bool
+        If True, also return the full downloaded table (before later
+        :meth:`~gaia_clustering.pipeline.GaiaQuery.refine_search` cuts).
+    ruwe_max : float or None
+        Maximum RUWE. ``None`` (default) skips the cut.
+    plx_snr_min : float or None
+        Minimum ``parallax_over_error``. ``None`` (default) skips the cut.
 
     Returns
     -------
     catalog : pandas.DataFrame
-        Gaia astrometry (no radial velocities).
+        Gaia astrometry (no radial velocities) inside the search cone
+        and optional parallax range.
     query_info : dict
         Resolution metadata, search parameters, and row counts.
+    extended : pandas.DataFrame, optional
+        Full downloaded table, only if ``return_extended`` is True.
     """
+    cache_dir = _resolve_cache_dir(cache_dir)
     resolved = resolve_name(name)
-    if resolved["status"] == "unrecognized":
-        raise ValueError("SIMBAD/Sesame did not recognize {!r}".format(name))
-    if not np.isfinite(resolved["simbad_ra"]):
-        raise ValueError("No coordinates for {!r}".format(name))
+    if resolved["status"] == "unrecognized" or not np.isfinite(resolved["simbad_ra"]):
+        raise NameResolutionError(
+            "Could not resolve the target name {!r} with CDS Sesame/SIMBAD. "
+            "Check the spelling, or look up a SIMBAD identifier at "
+            "https://simbad.cds.unistra.fr/simbad/.".format(name)
+        )
+    print(
+        "  resolved {!r} → {} ({})".format(
+            name, resolved.get("simbad_main_id") or name, resolved.get("kind"),
+        )
+    )
+    center_ra, center_dec = float(resolved["simbad_ra"]), float(resolved["simbad_dec"])
+
+    position_radius_arcmin = float(position_radius_arcmin)
+    radius_deg = arcmin_to_deg(position_radius_arcmin)
+    plx_range = _as_cut_pair(parallax_range, "parallax_range")
 
     seed = None
     if resolved["gaia_source_id"] is not None:
@@ -371,48 +819,40 @@ def fetch_neighbourhood(
         if seed is not None and len(seed) == 0:
             seed = None
 
-    catalog = query_gaia_cone(
-        resolved["simbad_ra"],
-        resolved["simbad_dec"],
-        radius_deg=radius_deg,
-        g_max=g_max,
-        ruwe_max=ruwe_max,
-        plx_snr_min=plx_snr_min,
-        top=top,
-        cache_dir=cache_dir,
+    extended = _load_cone(
+        resolved, seed, position_radius_arcmin, g_max, ruwe_max, plx_snr_min,
+        top, cache_dir,
+        parallax_lo=None if plx_range is None else plx_range[0],
+        parallax_hi=None if plx_range is None else plx_range[1],
+        ra=center_ra, dec=center_dec,
     )
-    n_cone = len(catalog)
-
-    pi0 = None
-    if seed is not None and "parallax" in seed.columns and len(seed):
-        pi0 = float(seed["parallax"].iloc[0])
-    if pi0 is not None and parallax_window is not None:
-        catalog = apply_parallax_window(
-            catalog, pi0, frac_lo=parallax_window[0], frac_hi=parallax_window[1]
-        )
-
-    if seed is not None and len(seed) and "source_id" in catalog.columns:
-        missing = ~seed["source_id"].isin(catalog["source_id"])
-        if missing.any():
-            catalog = pd.concat([catalog, seed.loc[missing]], ignore_index=True)
-
-    catalog = catalog.drop_duplicates(subset=["source_id"]).reset_index(drop=True)
-    # Never let a Gaia RV column sneak in if a future query adds one.
-    for col in ("radial_velocity", "radial_velocity_error"):
-        if col in catalog.columns:
-            catalog = catalog.drop(columns=[col])
 
     query_info = {
         **resolved,
-        "radius_deg": float(radius_deg),
-        "g_max": float(g_max),
-        "ruwe_max": float(ruwe_max),
-        "plx_snr_min": float(plx_snr_min),
-        "parallax_window": parallax_window,
-        "reference_parallax": pi0,
-        "n_cone": int(n_cone),
-        "n_catalog": int(len(catalog)),
+        "center_ra": float(center_ra),
+        "center_dec": float(center_dec),
+        "position_center": None,
+        "center_position": None,
+        "position_radius_arcmin": position_radius_arcmin,
+        "radius_arcmin": position_radius_arcmin,
+        "radius_deg": radius_deg,
+        "search_radius_arcmin": position_radius_arcmin,
+        "search_radius_deg": radius_deg,
+        "preview_factor": 1.0,
+        "preview_radius_arcmin": position_radius_arcmin,
+        "preview_radius_deg": radius_deg,
+        "g_max": _as_float_or_none(g_max),
+        "ruwe_max": _as_float_or_none(ruwe_max),
+        "plx_snr_min": _as_float_or_none(plx_snr_min),
+        "parallax_range": None if plx_range is None else tuple(plx_range),
+        "parallax_window": None,
+        "parallax_cuts": None if plx_range is None else tuple(plx_range),
+        "n_extended": int(len(extended)),
     }
+    catalog = apply_query_cuts(extended, query_info, seed=seed)
+    query_info["n_extended"] = int(len(extended))
+    if return_extended:
+        return catalog, query_info, extended
     return catalog, query_info
 
 
